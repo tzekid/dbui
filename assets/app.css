@@ -110,7 +110,7 @@ button, input, select, textarea { font: inherit; }
   background: var(--surface);
 }
 .sidebar-disclosure > summary { display: none; }
-.sidebar-disclosure:not([open]) > .sidebar-body { display: block; }
+.sidebar-disclosure:not([open]) > summary { display: list-item; padding: 10px 12px; cursor: pointer; font-weight: 650; }
 .sidebar-body { position: sticky; top: 0; max-height: calc(100vh - 48px); padding: 14px 12px 24px; overflow: auto; }
 .object-search { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 6px; margin-bottom: 18px; }
 .object-search label { grid-column: 1 / -1; color: var(--text-muted); font-size: 12px; }
@@ -206,7 +206,7 @@ th { position: sticky; top: 0; z-index: 1; color: var(--text-muted); background:
 th a { color: inherit; text-decoration: none; }
 td { max-width: 440px; }
 .data-grid { width: max-content; min-width: 100%; }
-.data-grid td { white-space: pre-wrap; overflow-wrap: anywhere; }
+.data-grid td { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .value--integer, .value--real { text-align: right; font-variant-numeric: tabular-nums; }
 .null-token { color: var(--text-muted); font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-style: italic; }
 .value-note, .truncation { color: var(--text-muted); font-size: 11px; }
@@ -278,7 +278,7 @@ th.action-column { z-index: 3; background: var(--surface-muted); }
   .main { padding: 22px 16px 48px; }
   .app-shell { display: block; }
   .sidebar { min-height: 0; border-right: 0; border-bottom: 1px solid var(--border); }
-  .sidebar-disclosure > summary { display: block; padding: 10px 16px; cursor: pointer; font-weight: 650; }
+  .sidebar-disclosure > summary { display: list-item; padding: 10px 16px; cursor: pointer; font-weight: 650; }
   .sidebar-disclosure:not([open]) > .sidebar-body { display: none; }
   .sidebar-body { position: static; max-height: 50vh; padding: 4px 16px 16px; }
   .filter-bar { align-items: stretch; }

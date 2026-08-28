@@ -95,7 +95,9 @@ pub fn databaseIndex(
         try writer.writeAll("</a></h2><p class=\"meta\">");
         try writer.print("{d} tables · {d} views · ", .{ item.overview.tables, item.overview.views });
         try writeSize(writer, item.file_size);
-        try writer.print(" · Modified <time datetime=\"{d}\">{d}</time></p></div>", .{ item.modified_seconds, item.modified_seconds });
+        try writer.writeAll(" · Modified ");
+        try writeModifiedTime(writer, item.modified_seconds);
+        try writer.writeAll("</p></div>");
         try modeBadge(writer, item.database);
         try writer.writeAll("</article>");
     }
@@ -121,7 +123,9 @@ pub fn databaseOverview(allocator: std.mem.Allocator, page: OverviewPage) ![]u8 
     try writer.writeAll("<div><dt>Size</dt><dd>");
     try writeSize(writer, page.file_size);
     try writer.writeAll("</dd></div>");
-    try writer.print("<div><dt>Modified</dt><dd><time datetime=\"{d}\">{d}</time></dd></div>", .{ page.modified_seconds, page.modified_seconds });
+    try writer.writeAll("<div><dt>Modified</dt><dd>");
+    try writeModifiedTime(writer, page.modified_seconds);
+    try writer.writeAll("</dd></div>");
     try factText(writer, "SQLite library", page.overview.sqlite_version);
     try writer.print("<div><dt>user_version</dt><dd>{d}</dd></div><div><dt>application_id</dt><dd>{d}</dd></div>", .{ page.overview.user_version, page.overview.application_id });
     try factText(writer, "Journal mode", page.overview.journal_mode);
@@ -613,11 +617,16 @@ fn renderValueContent(writer: *std.Io.Writer, value: browse.Value) !void {
 }
 
 fn renderPagination(writer: *std.Io.Writer, page: DataPage) !void {
+    if (page.result.rows.len == 0 and page.result.options.page == 0) return;
     const start = page.result.options.page * page.result.options.size + 1;
     const end = if (page.result.rows.len == 0) start - 1 else start + page.result.rows.len - 1;
-    try writer.writeAll("<nav class=\"pagination\" aria-label=\"Data pages\"><p>");
-    if (page.result.rows.len == 0) try writer.writeAll("No rows") else try writer.print("Rows {d}–{d}", .{ start, end });
-    try writer.writeAll("</p><div>");
+    try writer.writeAll("<nav class=\"pagination\" aria-label=\"Data pages\">");
+    if (page.result.rows.len == 0) {
+        try writer.writeAll("<span></span>");
+    } else {
+        try writer.print("<p>Rows {d}–{d}</p>", .{ start, end });
+    }
+    try writer.writeAll("<div>");
     if (page.result.options.page > 0) {
         try writer.writeAll("<a class=\"button\" href=\"");
         try dataHref(writer, page, .{ .page = page.result.options.page - 1 });
@@ -741,6 +750,26 @@ fn writeHex(writer: *std.Io.Writer, bytes: []const u8) !void {
     }
 }
 
+fn writeModifiedTime(writer: *std.Io.Writer, seconds: i64) !void {
+    if (seconds < 0) {
+        try writer.print("{d}", .{seconds});
+        return;
+    }
+    const epoch = std.time.epoch.EpochSeconds{ .secs = @intCast(seconds) };
+    const year_day = epoch.getEpochDay().calculateYearDay();
+    const month_day = year_day.calculateMonthDay();
+    const day_seconds = epoch.getDaySeconds();
+    const month = month_day.month.numeric();
+    const day = month_day.day_index + 1;
+    const hour = day_seconds.getHoursIntoDay();
+    const minute = day_seconds.getMinutesIntoHour();
+    const second = day_seconds.getSecondsIntoMinute();
+    try writer.print(
+        "<time datetime=\"{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z\">{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2} UTC</time>",
+        .{ year_day.year, month, day, hour, minute, second, year_day.year, month, day, hour, minute },
+    );
+}
+
 fn urlComponent(writer: *std.Io.Writer, value: []const u8) !void {
     const digits = "0123456789ABCDEF";
     for (value) |byte| {
@@ -789,7 +818,7 @@ fn shellStart(
 ) !void {
     try html.documentStart(writer, .{
         .title = title,
-        .head = .audited("<link rel=\"stylesheet\" href=\"/assets/app.css\"><script src=\"/assets/app.js\" defer></script>"),
+        .head = .audited("<link rel=\"icon\" href=\"data:,\"><link rel=\"stylesheet\" href=\"/assets/app.css\"><script src=\"/assets/app.js\" defer></script>"),
     });
     try writer.writeAll("<header class=\"topbar\"><a class=\"brand\" href=\"/\">dbui</a>");
     if (current) |database| {
@@ -853,7 +882,7 @@ fn firstObject(objects: []const schema.ObjectMeta) ?[]const u8 {
 }
 
 fn renderSidebar(writer: *std.Io.Writer, sidebar: Sidebar, active: Section) !void {
-    try writer.writeAll("<aside class=\"sidebar\"><details class=\"sidebar-disclosure\"><summary>Objects</summary><div class=\"sidebar-body\"><form class=\"object-search\" method=\"get\" action=\"/db/");
+    try writer.writeAll("<aside class=\"sidebar\"><details class=\"sidebar-disclosure\" open><summary>Objects</summary><div class=\"sidebar-body\"><form class=\"object-search\" method=\"get\" action=\"/db/");
     try html.attribute(writer, sidebar.database.id);
     try writer.writeAll(switch (active) {
         .schema => "/schema",
@@ -902,6 +931,16 @@ fn renderSidebar(writer: *std.Io.Writer, sidebar: Sidebar, active: Section) !voi
     try writer.writeAll("\">");
     try writer.writeAll(if (sidebar.show_internal) "Hide internal objects" else "Show internal objects");
     try writer.writeAll("</a></div></details></aside>");
+}
+
+test "modified timestamps render as human UTC with machine-readable datetime" {
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    try writeModifiedTime(&output.writer, 1781655600);
+    try std.testing.expectEqualStrings(
+        "<time datetime=\"2026-06-17T00:20:00Z\">2026-06-17 00:20 UTC</time>",
+        output.written(),
+    );
 }
 
 fn objectGroup(
