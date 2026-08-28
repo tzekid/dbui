@@ -1,0 +1,24 @@
+.{
+    .name = .dbui,
+    .version = "0.1.0-dev",
+    .fingerprint = 0xb875f449e0c985d9,
+    .minimum_zig_version = "0.17.0-dev.1509+bb296ab9b",
+    .dependencies = .{
+        // dbui is deployed beside the owner's existing web.zig checkout.
+        .web = .{ .path = "../web.zig" },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        ".zigversion",
+        ".zig-sha256",
+        "src",
+        "assets",
+        "vendor",
+        "testdata",
+        "tests",
+        "examples",
+        "deploy",
+        "README.md",
+    },
+}

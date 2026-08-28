@@ -1,0 +1,7 @@
+dbui.plosca.ru {
+    basic_auth {
+        admin <caddy-supported-password-hash>
+    }
+
+    reverse_proxy 127.0.0.1:7432
+}

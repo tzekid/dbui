@@ -1,0 +1,38 @@
+[Unit]
+Description=dbui SQLite web workbench
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/.local/share/dbui
+ExecStartPre=%h/.local/opt/dbui/current/bin/dbui --config %h/.config/dbui/config.json --check
+ExecStart=%h/.local/opt/dbui/current/bin/dbui --config %h/.config/dbui/config.json
+Restart=on-failure
+RestartSec=2s
+TimeoutStopSec=12s
+KillSignal=SIGTERM
+UMask=0077
+
+NoNewPrivileges=yes
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryHigh=64M
+MemoryMax=128M
+TasksMax=16
+LimitNOFILE=512
+CapabilityBoundingSet=
+AmbientCapabilities=
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=default.target

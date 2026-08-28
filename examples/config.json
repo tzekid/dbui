@@ -1,0 +1,11 @@
+{
+  "listen": "127.0.0.1:7432",
+  "databases": [
+    {
+      "id": "example",
+      "label": "Example",
+      "path": "/srv/example/data/example.db",
+      "mode": "read-only"
+    }
+  ]
+}

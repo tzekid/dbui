@@ -1,0 +1,4 @@
+/.zig-cache/
+/zig-out/
+/testdata/*.db
+/testdata/runtime-*.json
