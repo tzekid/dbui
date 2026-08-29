@@ -91,6 +91,9 @@ curl --silent --fail 'http://127.0.0.1:17432/db/fixture/data?object=odd%20table&
 grep -q 'quoted identifier' "$runtime_dir/odd.html"
 curl --silent --fail 'http://127.0.0.1:17432/db/fixture/schema?object=generated_values' -o "$runtime_dir/schema.html"
 grep -q 'Generated virtual' "$runtime_dir/schema.html"
+grep -q '<pre><code data-sql-static>' "$runtime_dir/schema.html"
+curl --silent --fail 'http://127.0.0.1:17432/db/fixture/schema?object=users' -o "$runtime_dir/users-schema.html"
+[[ $(grep -o 'data-sql-static' "$runtime_dir/users-schema.html" | wc -l) -eq 3 ]]
 curl --silent --fail 'http://127.0.0.1:17432/db/fixture/data?object=empty_table&size=25' -o "$runtime_dir/empty.html"
 grep -q 'No rows match this view' "$runtime_dir/empty.html"
 [[ $(grep -o 'No rows' "$runtime_dir/empty.html" | wc -l) -eq 1 ]]
@@ -108,6 +111,9 @@ csrf=$(sed -n 's/.*name="csrf_token" value="\([^"]*\)".*/\1/p' "$runtime_dir/que
 [[ ${#csrf} -eq 64 ]]
 grep -q 'Search files and objects' "$runtime_dir/query.html"
 grep -q 'crlf.sql' "$runtime_dir/query.html"
+grep -q 'data-sql-editor' "$runtime_dir/query.html"
+grep -q 'data-sql-highlight aria-hidden="true" inert' "$runtime_dir/query.html"
+grep -q '<textarea id="sql" name="sql" data-sql' "$runtime_dir/query.html"
 if grep -q 'hidden-link.sql' "$runtime_dir/query.html"; then
     echo 'query sidebar exposed a symlink' >&2
     exit 1

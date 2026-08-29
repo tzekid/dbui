@@ -276,7 +276,7 @@ pub fn schemaPage(allocator: std.mem.Allocator, page: SchemaPage) ![]u8 {
     if (page.sidebar.show_internal) try writer.writeAll("&amp;internal=1");
     try writer.writeAll("\">Browse data</a></header><section class=\"schema-section\"><h2>Definition</h2>");
     if (page.details.sql) |sql| {
-        try writer.writeAll("<pre><code>");
+        try writer.writeAll("<pre><code data-sql-static>");
         try html.text(writer, sql);
         try writer.writeAll("</code></pre>");
     } else {
@@ -356,9 +356,9 @@ pub fn queryPage(allocator: std.mem.Allocator, page: QueryPage) ![]u8 {
             try html.attribute(writer, page.sidebar.search);
             try writer.writeAll("\">");
         }
-        try writer.writeAll("<label for=\"sql\">SQL</label><textarea id=\"sql\" name=\"sql\" data-sql rows=\"16\" wrap=\"off\" spellcheck=\"false\">");
+        try writer.writeAll("<label for=\"sql\">SQL</label><div class=\"sql-editor\" data-sql-editor><pre class=\"sql-editor__highlight\" data-sql-highlight aria-hidden=\"true\" inert><code></code></pre><textarea id=\"sql\" name=\"sql\" data-sql rows=\"16\" wrap=\"off\" spellcheck=\"false\" autocomplete=\"off\" autocapitalize=\"off\" autocorrect=\"off\">");
         try html.text(writer, page.sql);
-        try writer.writeAll("</textarea>");
+        try writer.writeAll("</textarea></div><span class=\"sql-highlight-status\" data-sql-highlight-status role=\"status\" hidden>Syntax colors simplified for this large file.</span>");
         if (page.confirmation_required) try writer.writeAll("<label class=\"write-confirmation\"><input type=\"checkbox\" name=\"confirm_write\" value=\"1\" required> Confirm and run this write</label>");
         try writer.writeAll("<div class=\"query-actions\"><button type=\"submit\" data-run-button");
         if (page.file_conflict) try writer.writeAll(" disabled");
@@ -852,7 +852,7 @@ fn renderIndexes(writer: *std.Io.Writer, indexes: []const schema.IndexMeta) !voi
         }
         try writer.writeAll("</ul>");
         if (index.sql) |sql| {
-            try writer.writeAll("<pre><code>");
+            try writer.writeAll("<pre><code data-sql-static>");
             try html.text(writer, sql);
             try writer.writeAll("</code></pre>");
         }
@@ -894,7 +894,7 @@ fn renderTriggers(writer: *std.Io.Writer, triggers: []const schema.TriggerMeta) 
         try html.text(writer, trigger.name);
         try writer.writeAll("</code></h3>");
         if (trigger.sql) |sql| {
-            try writer.writeAll("<pre><code>");
+            try writer.writeAll("<pre><code data-sql-static>");
             try html.text(writer, sql);
             try writer.writeAll("</code></pre>");
         }

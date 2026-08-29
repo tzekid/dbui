@@ -62,6 +62,8 @@ The Query page can keep ordinary `.sql` files beside the database-object navigat
 - Scratch is unsaved until `Save as file` is used.
 - A visible Save action and `Ctrl/Cmd+S` persist the current file.
 - `Ctrl/Cmd+Enter` runs the browser selection when present, otherwise the SQLite statement at the caret.
+- The native textarea is progressively enhanced with SQLite-specific syntax colors; it remains the sole editable and submitted source.
+- Stored object, index, and trigger SQL on Schema pages uses the same optional syntax colors.
 - Results update below the editor without replacing its selection, focus, scroll, or undo state.
 - JavaScript disabled: file lifecycle still works through ordinary forms, and Query executes the whole textarea when it contains exactly one statement.
 - A file may contain many statements, but one Run executes exactly one statement. Multi-statement selection and Run All are deliberately deferred.
@@ -150,7 +152,7 @@ Do not naively copy an active database as a backup without accounting for its ro
 - One trusted administrator with external authentication
 - One SQL statement per Run; no Run All or multiple result tabs
 - File-backed saved SQL is optional; there is no automatic query history, folder tree, or autocomplete
-- No passive current-statement highlighting in the native textarea
+- No passive background highlight for the current statement range
 - External SQL-file edits are detected on the next action or reload, not pushed live
 - No structured insert form
 - No BLOB editing or download
