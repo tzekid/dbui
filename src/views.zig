@@ -351,7 +351,9 @@ pub fn queryPage(allocator: std.mem.Allocator, page: QueryPage) ![]u8 {
     if (can_edit) {
         try writer.writeAll("<form id=\"query-editor\" class=\"query-form\" method=\"post\" data-query-form data-query-resolve=\"/db/");
         try html.attribute(writer, page.database.id);
-        try writer.writeAll("/query/resolve\" action=\"/db/");
+        try writer.writeAll("/query/resolve\" data-database-id=\"");
+        try html.attribute(writer, page.database.id);
+        try writer.writeAll("\" action=\"/db/");
         try html.attribute(writer, page.database.id);
         try writer.writeAll("/query\"><input type=\"hidden\" name=\"csrf_token\" value=\"");
         try html.attribute(writer, page.csrf_token);
@@ -423,7 +425,7 @@ fn queryFileHeader(writer: *std.Io.Writer, page: QueryPage) !void {
     try writer.writeAll("<header class=\"query-file-header\"><div><p class=\"eyebrow\">");
     if (page.document) |document| {
         if (document.kind == .scratch) {
-            try writer.writeAll("SQL scratch</p><h1>Scratch</h1><p>Kept in this query workspace.</p></div><div class=\"query-file-controls\">");
+            try writer.writeAll("SQL scratch</p><h1>Scratch</h1><p>Saved on this server for this database.</p></div><div class=\"query-file-controls\">");
             if (document.editable()) {
                 if (page.file_conflict) {
                     try writer.writeAll("<span class=\"query-save-state query-save-state--conflict\" data-save-state data-initial-dirty aria-live=\"polite\">Conflict</span><a class=\"button\" href=\"/db/");
@@ -436,7 +438,7 @@ fn queryFileHeader(writer: *std.Io.Writer, page: QueryPage) !void {
                     if (page.initial_unsaved)
                         try writer.writeAll("Unsaved changes")
                     else if (document.revision != null)
-                        try writer.writeAll("Autosaved")
+                        try writer.writeAll("Saved on server")
                     else
                         try writer.writeAll("Not saved yet");
                     try writer.writeAll("</span><button class=\"button\" type=\"submit\" form=\"query-editor\" formaction=\"/db/");
@@ -1060,7 +1062,7 @@ fn shellStart(
     // Versioned URLs bypass browsers that cached older embedded assets.
     try html.documentStart(writer, .{
         .title = title,
-        .head = .audited("<link rel=\"icon\" href=\"data:,\"><link rel=\"stylesheet\" href=\"/assets/app.css?v=4\"><script src=\"/assets/app.js?v=4\" defer></script>"),
+        .head = .audited("<link rel=\"icon\" href=\"data:,\"><link rel=\"stylesheet\" href=\"/assets/app.css?v=5\"><script src=\"/assets/app.js?v=5\" defer></script>"),
     });
     try writer.writeAll("<header class=\"topbar\"><a class=\"brand\" href=\"/\">dbui</a>");
     if (current) |database| {

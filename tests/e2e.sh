@@ -76,8 +76,8 @@ curl --silent --fail --dump-header "$runtime_dir/headers" http://127.0.0.1:17432
 grep -qi '^content-security-policy:' "$runtime_dir/headers"
 grep -qi '^cache-control: no-store' "$runtime_dir/headers"
 grep -q 'Fixture read-only' "$runtime_dir/index.html"
-grep -q 'href="/assets/app.css?v=4"' "$runtime_dir/index.html"
-grep -q 'src="/assets/app.js?v=4"' "$runtime_dir/index.html"
+grep -q 'href="/assets/app.css?v=5"' "$runtime_dir/index.html"
+grep -q 'src="/assets/app.js?v=5"' "$runtime_dir/index.html"
 
 mv "$ro_db" "$runtime_dir/fixture-ro.offline"
 curl --silent --fail http://127.0.0.1:17432/ -o "$runtime_dir/index-unavailable.html"
@@ -124,7 +124,7 @@ grep -q 'No rows match this view' "$runtime_dir/empty.html"
 [[ $(grep -o 'No rows' "$runtime_dir/empty.html" | wc -l) -eq 1 ]]
 curl --silent --fail http://127.0.0.1:17432/db/fixture -o "$runtime_dir/overview.html"
 rg -q '<time datetime="[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z">[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2} UTC</time>' "$runtime_dir/overview.html"
-curl --silent --fail --dump-header "$runtime_dir/asset-headers" 'http://127.0.0.1:17432/assets/app.css?v=4' -o "$runtime_dir/app.css"
+curl --silent --fail --dump-header "$runtime_dir/asset-headers" 'http://127.0.0.1:17432/assets/app.css?v=5' -o "$runtime_dir/app.css"
 grep -qi '^cache-control: no-store' "$runtime_dir/asset-headers"
 if grep -Fq '.sidebar-disclosure:not([open]) > .sidebar-body { display: block; }' "$runtime_dir/app.css"; then
     echo 'closed sidebar content override returned' >&2
@@ -143,6 +143,7 @@ grep -q 'Search files and objects' "$runtime_dir/query.html"
 grep -q 'crlf.sql' "$runtime_dir/query.html"
 grep -q 'data-sql-editor' "$runtime_dir/query.html"
 grep -q 'data-query-resolve="/db/fixture/query/resolve"' "$runtime_dir/query.html"
+grep -q 'data-database-id="fixture"' "$runtime_dir/query.html"
 grep -q 'data-sql-highlight aria-hidden="true" inert' "$runtime_dir/query.html"
 grep -q '<textarea id="sql" name="sql" data-sql' "$runtime_dir/query.html"
 if grep -q 'hidden-link.sql' "$runtime_dir/query.html"; then

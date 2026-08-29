@@ -37,6 +37,7 @@
   const SQLITE_LITERALS = new Set(["NULL", "TRUE", "FALSE", "CURRENT_DATE", "CURRENT_TIME", "CURRENT_TIMESTAMP"]);
   const MAX_HIGHLIGHT_CHARACTERS = 65536;
   const MAX_HIGHLIGHT_SPANS = 4096;
+  const SCRATCH_SAVE_DELAY_MS = 500;
 
   const isAsciiLetter = (code) => (code >= 65 && code <= 90) || (code >= 97 && code <= 122);
   const isDigit = (code) => code >= 48 && code <= 57;
@@ -303,6 +304,7 @@
   const highlightStatus = form.querySelector("[data-sql-highlight-status]");
   const encoder = new TextEncoder();
   const persistentScratch = Boolean(scratchField && saveButton);
+  const scratchRecoveryKey = persistentScratch && form.dataset.databaseId ? `dbui:scratch:${form.dataset.databaseId}` : null;
   const fileConflict = runButton.disabled;
   let dirty = Boolean(saveState?.hasAttribute("data-initial-dirty")) || (!fileField && !scratchField && editor.value.length > 0);
   let busy = false;
@@ -586,6 +588,81 @@
     return values;
   }
 
+  function clearScratchRecovery() {
+    if (!scratchRecoveryKey) return;
+    try {
+      localStorage.removeItem(scratchRecoveryKey);
+    } catch (_error) {
+      // Server persistence remains authoritative when browser storage is unavailable.
+    }
+  }
+
+  function storeScratchRecovery() {
+    if (!scratchRecoveryKey) return;
+    try {
+      localStorage.setItem(scratchRecoveryKey, JSON.stringify({
+        version: 1,
+        revision: revisionField?.value || "",
+        source: editor.value,
+      }));
+    } catch (_error) {
+      // Keepalive server saves remain available when browser storage is disabled.
+    }
+  }
+
+  function restoreScratchRecovery() {
+    if (!scratchRecoveryKey) return;
+    let recovery;
+    try {
+      const encoded = localStorage.getItem(scratchRecoveryKey);
+      if (!encoded) return;
+      recovery = JSON.parse(encoded);
+    } catch (_error) {
+      clearScratchRecovery();
+      return;
+    }
+    if (
+      recovery?.version !== 1 ||
+      typeof recovery.revision !== "string" ||
+      typeof recovery.source !== "string" ||
+      (recovery.revision !== "" && !/^[0-9a-f]{64}$/.test(recovery.revision))
+    ) {
+      clearScratchRecovery();
+      return;
+    }
+    if (recovery.source === editor.value) {
+      clearScratchRecovery();
+      return;
+    }
+
+    editor.value = recovery.source;
+    editGeneration += 1;
+    dirty = true;
+    const serverRevision = revisionField?.value || "";
+    if (recovery.revision === serverRevision) {
+      if (saveState) saveState.textContent = "Recovered unsaved draft";
+      scheduleScratchSave();
+      return;
+    }
+
+    scratchConflict = true;
+    if (saveState) saveState.textContent = "Browser recovery";
+    updateRunAvailability();
+    if (responseRegion) {
+      const notice = document.createElement("section");
+      notice.className = "notice notice--warning";
+      const heading = document.createElement("strong");
+      heading.textContent = "Recovered a browser draft.";
+      const reload = document.createElement("a");
+      reload.className = "button";
+      reload.href = location.href;
+      reload.textContent = "Use server Scratch";
+      reload.addEventListener("click", clearScratchRecovery);
+      notice.append(heading, " The server copy changed too. Save this buffer as a named file, or ", reload, ".");
+      responseRegion.replaceChildren(notice);
+    }
+  }
+
   function replaceFullPage(source) {
     dirty = false;
     document.open();
@@ -633,10 +710,10 @@
     scratchSaveTimer = setTimeout(() => {
       scratchSaveTimer = null;
       void saveScratch();
-    }, 800);
+    }, SCRATCH_SAVE_DELAY_MS);
   }
 
-  async function saveScratch() {
+  async function saveScratch(keepalive = false) {
     if (!persistentScratch || scratchConflict) return false;
     if (scratchSavePromise) return scratchSavePromise;
     clearScratchSaveTimer();
@@ -647,14 +724,17 @@
         const response = await fetch(saveButton.formAction, {
           method: "POST",
           body: encodedForm({ fragment: "save-state", confirm_write: null }),
+          keepalive,
         });
         if (response.ok && response.headers.has("etag")) {
           updateRevision(response);
           if (generation === editGeneration) {
             dirty = false;
-            if (saveState) saveState.textContent = "Autosaved";
-          } else if (saveState) {
-            saveState.textContent = "Unsaved changes";
+            clearScratchRecovery();
+            if (saveState) saveState.textContent = "Saved on server";
+          } else {
+            storeScratchRecovery();
+            if (saveState) saveState.textContent = "Unsaved changes";
           }
           return true;
         }
@@ -681,11 +761,11 @@
     return saved;
   }
 
-  async function flushScratch() {
+  async function flushScratch(keepalive = false) {
     clearScratchSaveTimer();
     if (scratchSavePromise) await scratchSavePromise;
     if (!dirty || scratchConflict) return !dirty;
-    return saveScratch();
+    return saveScratch(keepalive);
   }
 
   async function waitForScratchSave() {
@@ -719,7 +799,8 @@
       if (fileField && saveState) saveState.textContent = "Saved";
       if (persistentScratch && response.headers.has("etag")) {
         dirty = false;
-        if (saveState) saveState.textContent = "Autosaved";
+        clearScratchRecovery();
+        if (saveState) saveState.textContent = "Saved on server";
       }
     } catch (_error) {
       if (responseRegion) responseRegion.textContent = "The query request could not reach dbui. No result was received.";
@@ -735,6 +816,7 @@
     if (writeCheckbox) writeCheckbox.checked = false;
     editGeneration += 1;
     setDirty();
+    storeScratchRecovery();
     scheduleScratchSave();
     updateScope();
   });
@@ -807,11 +889,28 @@
     }
   });
 
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "hidden" && persistentScratch && dirty && !scratchConflict) void flushScratch(true);
+  });
+
+  window.addEventListener("pagehide", () => {
+    if (persistentScratch && dirty && !scratchConflict) void flushScratch(true);
+  });
+
   window.addEventListener("beforeunload", (event) => {
     if (!dirty) return;
+    if (persistentScratch && !scratchConflict) {
+      void flushScratch(true);
+      return;
+    }
     event.preventDefault();
     event.returnValue = "";
   });
 
+  restoreScratchRecovery();
+  if (persistentScratch && dirty && !scratchConflict) {
+    storeScratchRecovery();
+    scheduleScratchSave();
+  }
   updateScope();
 })();

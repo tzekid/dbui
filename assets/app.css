@@ -343,6 +343,9 @@ code, pre, textarea[data-sql] { font-family: ui-monospace, SFMono-Regular, Menlo
 }
 .sql-execution-range {
   background: var(--sql-execution-background);
+  box-shadow:
+    0 .3em 0 var(--sql-execution-background),
+    0 -.3em 0 var(--sql-execution-background);
   -webkit-box-decoration-break: clone;
   box-decoration-break: clone;
 }

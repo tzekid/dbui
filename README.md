@@ -59,7 +59,8 @@ The listener is restricted to `127.0.0.1` or `::1`. Keep it behind an authentica
 The Query page can keep ordinary `.sql` files beside the database-object navigation. These are real server files, not records in a dbui control database:
 
 - Files are direct children of the configured query directory; no recursive file browser is exposed.
-- Scratch is one persistent draft per database, stored as the reserved `.dbui-scratch.sql` workspace file. It is created on the first save, hidden from the named-file list, and automatically saved after 800 ms without editor input.
+- Scratch is one persistent draft per database, stored as the reserved `.dbui-scratch.sql` workspace file. It is created on the first save, hidden from the named-file list, saved after 500 ms without editor input, and flushed when the page is backgrounded or closed.
+- While a server save is pending, the browser keeps a per-database recovery copy in same-origin local storage. It is removed as soon as the server confirms the same editor generation; if both copies changed, dbui preserves both and requires an explicit choice.
 - Opening Query selects the most recently written named file or Scratch. Explicit sidebar links always open the selected document.
 - A visible Save action and `Ctrl/Cmd+S` persist the current file.
 - The exact range that Run will execute is always highlighted: a browser selection wins, otherwise dbui asks SQLite to resolve the statement at the caret after a short debounce.
