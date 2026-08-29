@@ -1514,7 +1514,7 @@ fn health(request_context: *web_app.RequestContext) !Outcome {
 fn asset(request_context: *web_app.RequestContext, bytes: []const u8, content_type: []const u8, route_name: []const u8) !Outcome {
     try response.respond(request_context.request, bytes, .{
         .content_type = content_type,
-        .cache_control = "public, max-age=3600",
+        .cache_control = "no-store",
         .extra_headers = &security_headers,
     });
     return .{ .status = .ok, .route_name = route_name };

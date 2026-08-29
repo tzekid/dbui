@@ -1003,9 +1003,11 @@ fn shellStart(
     active: Section,
     sidebar_view: ?Sidebar,
 ) !void {
+    // Version 2 bypasses browsers that cached the original unversioned assets;
+    // asset responses are no-store so later deployments cannot go stale again.
     try html.documentStart(writer, .{
         .title = title,
-        .head = .audited("<link rel=\"icon\" href=\"data:,\"><link rel=\"stylesheet\" href=\"/assets/app.css\"><script src=\"/assets/app.js\" defer></script>"),
+        .head = .audited("<link rel=\"icon\" href=\"data:,\"><link rel=\"stylesheet\" href=\"/assets/app.css?v=2\"><script src=\"/assets/app.js?v=2\" defer></script>"),
     });
     try writer.writeAll("<header class=\"topbar\"><a class=\"brand\" href=\"/\">dbui</a>");
     if (current) |database| {
