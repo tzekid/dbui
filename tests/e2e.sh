@@ -76,8 +76,8 @@ curl --silent --fail --dump-header "$runtime_dir/headers" http://127.0.0.1:17432
 grep -qi '^content-security-policy:' "$runtime_dir/headers"
 grep -qi '^cache-control: no-store' "$runtime_dir/headers"
 grep -q 'Fixture read-only' "$runtime_dir/index.html"
-grep -q 'href="/assets/app.css?v=3"' "$runtime_dir/index.html"
-grep -q 'src="/assets/app.js?v=3"' "$runtime_dir/index.html"
+grep -q 'href="/assets/app.css?v=4"' "$runtime_dir/index.html"
+grep -q 'src="/assets/app.js?v=4"' "$runtime_dir/index.html"
 
 mv "$ro_db" "$runtime_dir/fixture-ro.offline"
 curl --silent --fail http://127.0.0.1:17432/ -o "$runtime_dir/index-unavailable.html"
@@ -124,7 +124,7 @@ grep -q 'No rows match this view' "$runtime_dir/empty.html"
 [[ $(grep -o 'No rows' "$runtime_dir/empty.html" | wc -l) -eq 1 ]]
 curl --silent --fail http://127.0.0.1:17432/db/fixture -o "$runtime_dir/overview.html"
 rg -q '<time datetime="[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z">[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2} UTC</time>' "$runtime_dir/overview.html"
-curl --silent --fail --dump-header "$runtime_dir/asset-headers" 'http://127.0.0.1:17432/assets/app.css?v=3' -o "$runtime_dir/app.css"
+curl --silent --fail --dump-header "$runtime_dir/asset-headers" 'http://127.0.0.1:17432/assets/app.css?v=4' -o "$runtime_dir/app.css"
 grep -qi '^cache-control: no-store' "$runtime_dir/asset-headers"
 if grep -Fq '.sidebar-disclosure:not([open]) > .sidebar-body { display: block; }' "$runtime_dir/app.css"; then
     echo 'closed sidebar content override returned' >&2
@@ -142,6 +142,7 @@ csrf=$(sed -n 's/.*name="csrf_token" value="\([^"]*\)".*/\1/p' "$runtime_dir/que
 grep -q 'Search files and objects' "$runtime_dir/query.html"
 grep -q 'crlf.sql' "$runtime_dir/query.html"
 grep -q 'data-sql-editor' "$runtime_dir/query.html"
+grep -q 'data-query-resolve="/db/fixture/query/resolve"' "$runtime_dir/query.html"
 grep -q 'data-sql-highlight aria-hidden="true" inert' "$runtime_dir/query.html"
 grep -q '<textarea id="sql" name="sql" data-sql' "$runtime_dir/query.html"
 if grep -q 'hidden-link.sql' "$runtime_dir/query.html"; then
@@ -257,6 +258,13 @@ fi
 
 trigger_source=$'CREATE TRIGGER current_scope_guard AFTER UPDATE ON users BEGIN SELECT 1; SELECT 2; END;\nSELECT 33 AS after_trigger;'
 cursor_byte=$(printf '%s' $'CREATE TRIGGER current_scope_guard AFTER UPDATE ON users BEGIN SELECT 1; SELECT 2; END;\nSELECT ' | wc -c)
+statement_start=$(printf '%s' $'CREATE TRIGGER current_scope_guard AFTER UPDATE ON users BEGIN SELECT 1; SELECT 2; END;\n' | wc -c)
+statement_end=$(printf '%s' "$trigger_source" | wc -c)
+status=$(curl --silent --data-urlencode "csrf_token=$csrf" --data-urlencode "sql=$trigger_source" --data-urlencode "cursor_byte=$cursor_byte" http://127.0.0.1:17432/db/fixture/query/resolve -o "$runtime_dir/resolved-range.txt" -w '%{http_code}')
+[[ $status == 200 ]]
+[[ $(cat "$runtime_dir/resolved-range.txt") == "range $statement_start $statement_end 2 2" ]]
+status=$(curl --silent --data-urlencode 'csrf_token=wrong' --data-urlencode 'sql=SELECT 1;' --data-urlencode 'cursor_byte=0' http://127.0.0.1:17432/db/fixture/query/resolve -o "$runtime_dir/resolve-csrf.html" -w '%{http_code}')
+[[ $status == 403 ]]
 status=$(curl --silent --data-urlencode "csrf_token=$csrf" --data-urlencode "sql=$trigger_source" --data-urlencode 'scope=current' --data-urlencode 'selection_start_byte=0' --data-urlencode 'selection_end_byte=0' --data-urlencode "cursor_byte=$cursor_byte" --data-urlencode 'fragment=query-result' http://127.0.0.1:17432/db/fixture/query -o "$runtime_dir/current.html" -w '%{http_code}')
 [[ $status == 200 ]]
 grep -q 'after_trigger' "$runtime_dir/current.html"

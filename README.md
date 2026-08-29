@@ -62,7 +62,8 @@ The Query page can keep ordinary `.sql` files beside the database-object navigat
 - Scratch is one persistent draft per database, stored as the reserved `.dbui-scratch.sql` workspace file. It is created on the first save, hidden from the named-file list, and automatically saved after 800 ms without editor input.
 - Opening Query selects the most recently written named file or Scratch. Explicit sidebar links always open the selected document.
 - A visible Save action and `Ctrl/Cmd+S` persist the current file.
-- `Ctrl/Cmd+Enter` runs the browser selection when present, otherwise the SQLite statement at the caret.
+- The exact range that Run will execute is always highlighted: a browser selection wins, otherwise dbui asks SQLite to resolve the statement at the caret after a short debounce.
+- `Ctrl/Cmd+Enter` runs only that highlighted range. The server still validates it as exactly one executable SQLite statement.
 - The native textarea is progressively enhanced with SQLite-specific syntax colors; it remains the sole editable and submitted source.
 - Stored object, index, and trigger SQL on Schema pages uses the same optional syntax colors.
 - Results update below the editor without replacing its selection, focus, scroll, or undo state.
@@ -153,7 +154,6 @@ Do not naively copy an active database as a backup without accounting for its ro
 - One trusted administrator with external authentication
 - One SQL statement per Run; no Run All or multiple result tabs
 - File-backed saved SQL is optional; there is no automatic query history, folder tree, or autocomplete
-- No passive background highlight for the current statement range
 - External SQL-file edits are detected on the next action or reload, not pushed live
 - No structured insert form
 - No BLOB editing or download

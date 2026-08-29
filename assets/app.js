@@ -231,21 +231,42 @@
     return { ranges, truncated };
   }
 
-  function renderHighlightedSql(source, target) {
+  function renderHighlightedSql(source, target, executionRange = null) {
     const highlightedSource = source.length > MAX_HIGHLIGHT_CHARACTERS ? source.slice(0, MAX_HIGHLIGHT_CHARACTERS) : source;
     const tokens = tokenizeSqlite(highlightedSource);
     if (highlightedSource.length !== source.length) tokens.truncated = true;
     const fragment = document.createDocumentFragment();
+
+    function appendSegment(start, end, kind = null) {
+      if (start >= end) return;
+      const cuts = [start];
+      if (executionRange?.start > start && executionRange.start < end) cuts.push(executionRange.start);
+      if (executionRange?.end > start && executionRange.end < end) cuts.push(executionRange.end);
+      cuts.push(end);
+      cuts.sort((left, right) => left - right);
+      for (let index = 0; index + 1 < cuts.length; index += 1) {
+        const pieceStart = cuts[index];
+        const pieceEnd = cuts[index + 1];
+        const inExecutionRange = executionRange && pieceStart < executionRange.end && pieceEnd > executionRange.start;
+        if (!kind && !inExecutionRange) {
+          fragment.append(document.createTextNode(source.slice(pieceStart, pieceEnd)));
+          continue;
+        }
+        const span = document.createElement("span");
+        if (kind) span.classList.add("sql-token", `sql-token--${kind}`);
+        if (inExecutionRange) span.classList.add("sql-execution-range");
+        span.textContent = source.slice(pieceStart, pieceEnd);
+        fragment.append(span);
+      }
+    }
+
     let cursor = 0;
     for (const token of tokens.ranges) {
-      if (token.start > cursor) fragment.append(document.createTextNode(source.slice(cursor, token.start)));
-      const span = document.createElement("span");
-      span.className = `sql-token sql-token--${token.kind}`;
-      span.textContent = source.slice(token.start, token.end);
-      fragment.append(span);
+      appendSegment(cursor, token.start);
+      appendSegment(token.start, token.end, token.kind);
       cursor = token.end;
     }
-    if (cursor < source.length) fragment.append(document.createTextNode(source.slice(cursor)));
+    appendSegment(cursor, source.length);
     target.replaceChildren(fragment);
     return tokens.truncated;
   }
@@ -272,6 +293,7 @@
   const cursorField = form.querySelector("[data-cursor-byte]");
   const scopeLabel = form.querySelector("[data-query-scope-label]");
   const revisionField = form.querySelector("[data-base-revision]");
+  const resolveUrl = form.dataset.queryResolve;
   const fileField = form.elements.namedItem("file");
   const scratchField = form.elements.namedItem("scratch");
   const writeCheckbox = form.elements.namedItem("confirm_write");
@@ -281,6 +303,7 @@
   const highlightStatus = form.querySelector("[data-sql-highlight-status]");
   const encoder = new TextEncoder();
   const persistentScratch = Boolean(scratchField && saveButton);
+  const fileConflict = runButton.disabled;
   let dirty = Boolean(saveState?.hasAttribute("data-initial-dirty")) || (!fileField && !scratchField && editor.value.length > 0);
   let busy = false;
   let pendingConfirmation = null;
@@ -289,6 +312,12 @@
   let scratchSavePromise = null;
   let scratchConflict = false;
   let createAfterSave = false;
+  let executionRange = null;
+  let executionRangeKey = null;
+  let statementResolveTimer = null;
+  let statementResolvePromise = null;
+  let statementResolvePromiseKey = null;
+  let scheduleSqlHighlight = () => {};
 
   function installSqlHighlighting() {
     if (!sqlEditor || !highlightLayer || !highlightCode || !highlightStatus) return;
@@ -313,7 +342,7 @@
       if (!enabled) return;
       try {
         const source = editor.value;
-        highlightStatus.hidden = !renderHighlightedSql(source, highlightCode);
+        highlightStatus.hidden = !renderHighlightedSql(source, highlightCode, executionRange);
         syncScroll();
         sqlEditor.classList.add("sql-editor--highlighted");
       } catch (_error) {
@@ -329,6 +358,7 @@
     editor.addEventListener("input", schedule);
     editor.addEventListener("scroll", syncScroll, { passive: true });
     window.addEventListener("pageshow", schedule);
+    scheduleSqlHighlight = schedule;
     paint();
   }
 
@@ -336,26 +366,179 @@
 
   const byteOffset = (index) => encoder.encode(editor.value.slice(0, index)).length;
   const lineAt = (index) => editor.value.slice(0, index).split("\n").length;
+  const editorScopeKey = () => `${editGeneration}:${editor.selectionStart}:${editor.selectionEnd}`;
   const scopeKey = () => [scopeField.value, selectionStartField.value, selectionEndField.value, cursorField.value].join(":");
+
+  function characterOffset(byte) {
+    if (!Number.isSafeInteger(byte) || byte < 0) return null;
+    let currentByte = 0;
+    let currentCharacter = 0;
+    for (const character of editor.value) {
+      if (currentByte === byte) return currentCharacter;
+      const codePoint = character.codePointAt(0);
+      currentByte += codePoint <= 0x7f ? 1 : codePoint <= 0x7ff ? 2 : codePoint <= 0xffff ? 3 : 4;
+      currentCharacter += character.length;
+      if (currentByte > byte) return null;
+    }
+    return currentByte === byte ? currentCharacter : null;
+  }
+
+  function lineRangeLabel(firstLine, lastLine) {
+    return firstLine === lastLine ? `Line ${firstLine}` : `Lines ${firstLine}–${lastLine}`;
+  }
+
+  function clearStatementResolveTimer() {
+    if (statementResolveTimer === null) return;
+    clearTimeout(statementResolveTimer);
+    statementResolveTimer = null;
+  }
+
+  function updateRunAvailability() {
+    const rangeReady = executionRange && executionRangeKey === editorScopeKey();
+    runButton.disabled = busy || fileConflict || scratchConflict || !rangeReady;
+  }
+
+  function setExecutionRange(range, key) {
+    executionRange = range;
+    executionRangeKey = range ? key : null;
+    scheduleSqlHighlight();
+    updateRunAvailability();
+  }
+
+  function applyExecutionRange(range, key, selected) {
+    scopeField.value = "selection";
+    selectionStartField.value = String(range.startByte);
+    selectionEndField.value = String(range.endByte);
+    cursorField.value = String(byteOffset(editor.selectionStart));
+    setExecutionRange(range, key);
+    runButton.textContent = writeCheckbox ? "Confirm and run write" : selected ? "Run selection" : "Run current statement";
+    scopeLabel.textContent = selected
+      ? lineRangeLabel(range.lineStart, range.lineEnd)
+      : `Current statement · ${lineRangeLabel(range.lineStart, range.lineEnd).toLocaleLowerCase()}`;
+  }
+
+  function showUnresolvedStatement(message, key) {
+    if (key !== editorScopeKey() || editor.selectionStart !== editor.selectionEnd) return;
+    const cursor = byteOffset(editor.selectionStart);
+    scopeField.value = "current";
+    selectionStartField.value = String(cursor);
+    selectionEndField.value = String(cursor);
+    cursorField.value = String(cursor);
+    setExecutionRange(null, null);
+    runButton.textContent = writeCheckbox ? "Confirm and run write" : "Run current statement";
+    scopeLabel.textContent = message;
+  }
+
+  async function resolveCurrentStatement(key) {
+    if (!resolveUrl) {
+      showUnresolvedStatement("Current statement preview unavailable · select SQL to run", key);
+      return false;
+    }
+    if (statementResolvePromise && statementResolvePromiseKey === key) return statementResolvePromise;
+    const cursor = byteOffset(editor.selectionStart);
+    const request = (async () => {
+      try {
+        const response = await fetch(resolveUrl, {
+          method: "POST",
+          body: encodedForm({
+            fragment: null,
+            confirm_write: null,
+            scope: "current",
+            selection_start_byte: "0",
+            selection_end_byte: "0",
+            cursor_byte: String(cursor),
+          }),
+        });
+        const source = (await response.text()).trim();
+        if (key !== editorScopeKey() || editor.selectionStart !== editor.selectionEnd) return false;
+        if (!response.ok) {
+          const message = source && !source.startsWith("<") ? source.slice(0, 180) : "Current statement preview unavailable · select SQL to run";
+          showUnresolvedStatement(message, key);
+          return false;
+        }
+        if (source === "none") {
+          showUnresolvedStatement("No statement at caret", key);
+          return false;
+        }
+        const match = /^range (\d+) (\d+) (\d+) (\d+)$/.exec(source);
+        if (!match) {
+          showUnresolvedStatement("Current statement preview unavailable · select SQL to run", key);
+          return false;
+        }
+        const startByte = Number(match[1]);
+        const endByte = Number(match[2]);
+        const lineStart = Number(match[3]);
+        const lineEnd = Number(match[4]);
+        const start = characterOffset(startByte);
+        const end = characterOffset(endByte);
+        if (start === null || end === null || start >= end || lineStart < 1 || lineEnd < lineStart) {
+          showUnresolvedStatement("Current statement preview unavailable · select SQL to run", key);
+          return false;
+        }
+        applyExecutionRange({ start, end, startByte, endByte, lineStart, lineEnd }, key, false);
+        return true;
+      } catch (_error) {
+        showUnresolvedStatement("Current statement preview unavailable · select SQL to run", key);
+        return false;
+      }
+    })();
+    statementResolvePromise = request;
+    statementResolvePromiseKey = key;
+    const resolved = await request;
+    if (statementResolvePromise === request) {
+      statementResolvePromise = null;
+      statementResolvePromiseKey = null;
+    }
+    return resolved;
+  }
+
+  function scheduleStatementResolution(key) {
+    clearStatementResolveTimer();
+    statementResolveTimer = setTimeout(() => {
+      statementResolveTimer = null;
+      void resolveCurrentStatement(key);
+    }, 140);
+  }
 
   function updateScope() {
     const start = editor.selectionStart;
     const end = editor.selectionEnd;
+    const key = editorScopeKey();
     const selected = start !== end;
-    scopeField.value = selected ? "selection" : "current";
-    selectionStartField.value = String(byteOffset(start));
-    selectionEndField.value = String(byteOffset(end));
-    cursorField.value = String(byteOffset(start));
     if (selected) {
+      clearStatementResolveTimer();
       const firstLine = lineAt(start);
       const lastLine = Math.max(firstLine, lineAt(end) - (editor.value[end - 1] === "\n" ? 1 : 0));
-      runButton.textContent = writeCheckbox?.checked ? "Confirm and run write" : "Run selection";
-      scopeLabel.textContent = firstLine === lastLine ? `Line ${firstLine}` : `Lines ${firstLine}–${lastLine}`;
+      applyExecutionRange({
+        start,
+        end,
+        startByte: byteOffset(start),
+        endByte: byteOffset(end),
+        lineStart: firstLine,
+        lineEnd: lastLine,
+      }, key, true);
+    } else if (executionRange && executionRangeKey === key) {
+      applyExecutionRange(executionRange, key, false);
     } else {
-      runButton.textContent = writeCheckbox?.checked ? "Confirm and run write" : "Run current statement";
-      scopeLabel.textContent = `Statement at caret · line ${lineAt(start)}`;
+      const cursor = byteOffset(start);
+      scopeField.value = "current";
+      selectionStartField.value = String(cursor);
+      selectionEndField.value = String(cursor);
+      cursorField.value = String(cursor);
+      setExecutionRange(null, null);
+      runButton.textContent = writeCheckbox ? "Confirm and run write" : "Run current statement";
+      scopeLabel.textContent = `Locating statement at line ${lineAt(start)}…`;
+      scheduleStatementResolution(key);
     }
     if (pendingConfirmation && pendingConfirmation !== scopeKey()) clearWriteConfirmation();
+  }
+
+  async function prepareExecutionScope() {
+    updateScope();
+    if (executionRange && executionRangeKey === editorScopeKey()) return true;
+    const key = editorScopeKey();
+    clearStatementResolveTimer();
+    return resolveCurrentStatement(key);
   }
 
   function markResultStale() {
@@ -382,7 +565,7 @@
 
   function setBusy(active, label) {
     busy = active;
-    runButton.disabled = active;
+    updateRunAvailability();
     if (saveButton) saveButton.disabled = active;
     if (active && label && saveState) saveState.textContent = label;
   }
@@ -477,7 +660,7 @@
         }
         await response.text();
         scratchConflict = response.status === 409;
-        if (scratchConflict) runButton.disabled = true;
+        updateRunAvailability();
         if (saveState) saveState.textContent = scratchConflict ? "Conflict" : "Autosave failed";
         if (responseRegion) {
           responseRegion.textContent = scratchConflict
@@ -512,11 +695,11 @@
   }
 
   async function runQuery(confirmed = false, reuseScope = false) {
-    if (busy || runButton.disabled) return;
+    if (busy || fileConflict || scratchConflict) return;
     if (fileField && dirty && !(await saveFile())) return;
     if (persistentScratch) await waitForScratchSave();
     if (scratchConflict) return;
-    if (!reuseScope) updateScope();
+    if (!reuseScope && !(await prepareExecutionScope())) return;
     setBusy(true, "Running…");
     const originalLabel = runButton.textContent;
     runButton.textContent = "Running…";
@@ -562,6 +745,9 @@
   });
   editor.addEventListener("keyup", updateScope);
   editor.addEventListener("mouseup", updateScope);
+  document.addEventListener("selectionchange", () => {
+    if (document.activeElement === editor) updateScope();
+  });
 
   form.addEventListener("submit", (event) => {
     const submitter = event.submitter;
@@ -627,5 +813,5 @@
     event.returnValue = "";
   });
 
-  if (!writeCheckbox) updateScope();
+  updateScope();
 })();

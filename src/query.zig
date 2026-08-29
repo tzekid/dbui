@@ -130,10 +130,18 @@ fn currentStatement(
     }
     if (range_count == 0) return error.EmptySql;
     for (ranges[0..range_count]) |range| {
-        if (cursor >= range.start and cursor < range.end) return range;
+        if (cursor >= range.start and cursor < range.end) return trimStatementWhitespace(source, range);
     }
-    if (cursor == source.len) return ranges[range_count - 1];
+    if (cursor == source.len) return trimStatementWhitespace(source, ranges[range_count - 1]);
     return error.NoStatementAtCursor;
+}
+
+fn trimStatementWhitespace(source: []const u8, range: ByteRange) ByteRange {
+    var start = range.start;
+    var end = range.end;
+    while (start < end and std.ascii.isWhitespace(source[start])) start += 1;
+    while (end > start and std.ascii.isWhitespace(source[end - 1])) end -= 1;
+    return .{ .start = start, .end = end };
 }
 
 fn validateOffset(source: []const u8, offset: usize) !void {

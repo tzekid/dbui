@@ -349,7 +349,9 @@ pub fn queryPage(allocator: std.mem.Allocator, page: QueryPage) ![]u8 {
     }
     const can_edit = if (page.document) |document| document.editable() else true;
     if (can_edit) {
-        try writer.writeAll("<form id=\"query-editor\" class=\"query-form\" method=\"post\" data-query-form action=\"/db/");
+        try writer.writeAll("<form id=\"query-editor\" class=\"query-form\" method=\"post\" data-query-form data-query-resolve=\"/db/");
+        try html.attribute(writer, page.database.id);
+        try writer.writeAll("/query/resolve\" action=\"/db/");
         try html.attribute(writer, page.database.id);
         try writer.writeAll("/query\"><input type=\"hidden\" name=\"csrf_token\" value=\"");
         try html.attribute(writer, page.csrf_token);
@@ -1058,7 +1060,7 @@ fn shellStart(
     // Versioned URLs bypass browsers that cached older embedded assets.
     try html.documentStart(writer, .{
         .title = title,
-        .head = .audited("<link rel=\"icon\" href=\"data:,\"><link rel=\"stylesheet\" href=\"/assets/app.css?v=3\"><script src=\"/assets/app.js?v=3\" defer></script>"),
+        .head = .audited("<link rel=\"icon\" href=\"data:,\"><link rel=\"stylesheet\" href=\"/assets/app.css?v=4\"><script src=\"/assets/app.js?v=4\" defer></script>"),
     });
     try writer.writeAll("<header class=\"topbar\"><a class=\"brand\" href=\"/\">dbui</a>");
     if (current) |database| {

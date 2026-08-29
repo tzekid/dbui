@@ -31,6 +31,7 @@ const Handler = enum {
     data,
     schema,
     query_get,
+    query_resolve,
     query_post,
     query_scratch_save,
     query_file_create,
@@ -58,6 +59,7 @@ const routes = [_]Route{
     .{ .method = .GET, .pattern = "/db/:database_id/data", .handler = .data },
     .{ .method = .GET, .pattern = "/db/:database_id/schema", .handler = .schema },
     .{ .method = .GET, .pattern = "/db/:database_id/query", .handler = .query_get },
+    .{ .method = .POST, .pattern = "/db/:database_id/query/resolve", .handler = .query_resolve },
     .{ .method = .POST, .pattern = "/db/:database_id/query", .handler = .query_post },
     .{ .method = .POST, .pattern = "/db/:database_id/query/scratch/save", .handler = .query_scratch_save },
     .{ .method = .POST, .pattern = "/db/:database_id/query/file/create", .handler = .query_file_create },
@@ -169,6 +171,7 @@ fn dispatch(context: *Context, request_context: *web_app.RequestContext, request
                 .data => data(context, request_context, target, database_id, request_id),
                 .schema => schemaPage(context, request_context, target, database_id, request_id),
                 .query_get => queryGet(context, request_context, target, database_id, request_id),
+                .query_resolve => queryResolve(context, request_context, database_id, request_id),
                 .query_post => queryPost(context, request_context, target, database_id, request_id),
                 .query_scratch_save => queryScratchSave(context, request_context, database_id, request_id),
                 .query_file_create => queryFileCreate(context, request_context, database_id, request_id),
@@ -447,6 +450,63 @@ fn queryGet(
     });
     try respondHtml(request_context.request, body, .ok);
     return .{ .status = .ok, .database_id = configured.id, .route_name = "query" };
+}
+
+fn queryResolve(
+    context: *Context,
+    request_context: *web_app.RequestContext,
+    database_id: []const u8,
+    request_id: u64,
+) !Outcome {
+    const configured = context.registry.find(database_id) orelse {
+        request_context.request.head.keep_alive = false;
+        try problem(context, request_context, null, .not_found, "Database not found", "That database is not configured.", request_id);
+        return .{ .status = .not_found, .database_id = database_id, .route_name = "query_resolve" };
+    };
+    const fields = readSourceForm(context, request_context) catch |err| {
+        return sourceFormError(context, request_context, configured, "query_resolve", request_id, err);
+    };
+    const source = query_files.canonicalizeEditorSource(request_context.arena, fields.get("sql") orelse "") catch |err| {
+        try respondText(request_context.request, submittedSourceErrorMessage(err), .unprocessable_entity);
+        return .{ .status = .unprocessable_entity, .database_id = configured.id, .route_name = "query_resolve" };
+    };
+    const cursor = parseFormOffset(fields.get("cursor_byte") orelse "0") catch {
+        try respondText(request_context.request, "The caret no longer matches the submitted UTF-8 source.\n", .unprocessable_entity);
+        return .{ .status = .unprocessable_entity, .database_id = configured.id, .route_name = "query_resolve" };
+    };
+    var database = sqlite.Database.open(request_context.arena, configured.path, configured.mode) catch |err| {
+        return unavailable(context, request_context, configured, "query_resolve", request_id, err);
+    };
+    defer database.deinit();
+    try database.installQueryAuthorizer();
+    const resolved = query_mod.resolveSource(
+        request_context.arena,
+        &database,
+        source,
+        .current,
+        0,
+        0,
+        cursor,
+    ) catch |err| switch (err) {
+        error.EmptySql, error.NoStatementAtCursor => {
+            try respondText(request_context.request, "none\n", .ok);
+            return .{ .status = .ok, .database_id = configured.id, .route_name = "query_resolve" };
+        },
+        else => {
+            const status = queryErrorStatus(err);
+            const message = try queryErrorMessage(request_context.arena, &database, err);
+            try respondText(request_context.request, message, status);
+            return .{ .status = status, .database_id = configured.id, .route_name = "query_resolve" };
+        },
+    };
+    const body = try std.fmt.allocPrint(request_context.arena, "range {d} {d} {d} {d}\n", .{
+        resolved.start_byte,
+        resolved.end_byte,
+        resolved.line_start,
+        resolved.line_end,
+    });
+    try respondText(request_context.request, body, .ok);
+    return .{ .status = .ok, .database_id = configured.id, .route_name = "query_resolve" };
 }
 
 fn queryPost(
@@ -1771,6 +1831,15 @@ fn respondHtml(http_request: *std.http.Server.Request, body: []const u8, status:
     try response.respond(http_request, body, .{
         .status = status,
         .content_type = "text/html; charset=utf-8",
+        .cache_control = "no-store",
+        .extra_headers = &security_headers,
+    });
+}
+
+fn respondText(http_request: *std.http.Server.Request, body: []const u8, status: std.http.Status) !void {
+    try response.respond(http_request, body, .{
+        .status = status,
+        .content_type = "text/plain; charset=utf-8",
         .cache_control = "no-store",
         .extra_headers = &security_headers,
     });
