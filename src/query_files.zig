@@ -1,6 +1,7 @@
 const std = @import("std");
 
 pub const maximum_source_bytes = 64 * 1024;
+pub const maximum_transported_source_bytes = maximum_source_bytes * 2;
 pub const maximum_files = 128;
 pub const maximum_directory_entries = 512;
 pub const maximum_filename_bytes = 80;
@@ -164,7 +165,7 @@ pub fn create(
     source: []const u8,
 ) !Document {
     try validateFilename(name);
-    try validateEditorSource(source);
+    const canonical_source = try canonicalizeEditorSource(allocator, source);
     var directory = try openWorkspace(io, workspace_path);
     defer directory.close(io);
 
@@ -172,15 +173,15 @@ pub fn create(
         .permissions = @fromBackingInt(@intCast(0o600)),
     });
     defer atomic.deinit(io);
-    try atomic.file.writeStreamingAll(io, source);
+    try atomic.file.writeStreamingAll(io, canonical_source);
     try atomic.file.sync(io);
     try atomic.link(io);
     try syncDirectory(io, directory);
 
     return .{
         .name = try allocator.dupe(u8, name),
-        .source = try allocator.dupe(u8, source),
-        .revision = hash(source),
+        .source = try allocator.dupe(u8, canonical_source),
+        .revision = hash(canonical_source),
         .newline_style = .lf,
     };
 }
@@ -195,14 +196,14 @@ pub fn save(
 ) !SaveResult {
     try validateFilename(name);
     try validateRevision(base_revision);
-    try validateEditorSource(source);
+    const canonical_source = try canonicalizeEditorSource(allocator, source);
     var directory = try openWorkspace(io, workspace_path);
     defer directory.close(io);
 
     const original = try readRaw(allocator, io, directory, name);
     if (!std.mem.eql(u8, &original.revision, base_revision)) return error.FileConflict;
     const normalized = normalize(allocator, original.bytes) catch return error.FileNotEditable;
-    const encoded = try encode(allocator, source, normalized.style);
+    const encoded = try encode(allocator, canonical_source, normalized.style);
     const next_revision = hash(encoded);
     if (std.mem.eql(u8, &original.revision, &next_revision)) {
         return .{ .revision = next_revision, .changed = false };
@@ -222,6 +223,20 @@ pub fn save(
     try atomic.replace(io);
     try syncDirectory(io, directory);
     return .{ .revision = next_revision, .changed = true };
+}
+
+/// HTML form submission transports textarea line breaks as CRLF even though
+/// the browser editor value uses LF. Keep that transport detail out of query
+/// execution and file storage while continuing to reject ambiguous input.
+pub fn canonicalizeEditorSource(allocator: std.mem.Allocator, source: []const u8) ![]const u8 {
+    if (source.len > maximum_transported_source_bytes) return error.SourceTooLarge;
+    if (std.mem.indexOfScalar(u8, source, '\r') == null) {
+        try validateEditorSource(source);
+        return source;
+    }
+    const normalized = try normalize(allocator, source);
+    try validateEditorSource(normalized.source);
+    return normalized.source;
 }
 
 pub fn rename(
@@ -433,6 +448,31 @@ test "query files preserve CRLF and reject stale revisions" {
     const saved_stat = try temporary.dir.statFile(std.testing.io, "workflow.sql", .{});
     try std.testing.expectEqual(@as(u32, 0o640), @as(u32, @intCast(@backingInt(saved_stat.permissions) & 0o777)));
     try std.testing.expectError(error.FileConflict, save(allocator, std.testing.io, path, document.name, &document.revision.?, "select 4;\n"));
+}
+
+test "submitted editor source canonicalizes browser CRLF and rejects ambiguous endings" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    const lf = "select 1;\nselect 2;\n";
+    try std.testing.expectEqualStrings(lf, try canonicalizeEditorSource(allocator, lf));
+    try std.testing.expectEqualStrings(lf, try canonicalizeEditorSource(allocator, "select 1;\r\nselect 2;\r\n"));
+    try std.testing.expectError(error.UnsupportedLineEndings, canonicalizeEditorSource(allocator, "select 1;\rselect 2;"));
+    try std.testing.expectError(error.UnsupportedLineEndings, canonicalizeEditorSource(allocator, "select 1;\r\nselect 2;\n"));
+
+    const maximum_transport = try allocator.alloc(u8, maximum_transported_source_bytes);
+    for (0..maximum_source_bytes) |index| {
+        maximum_transport[index * 2] = '\r';
+        maximum_transport[index * 2 + 1] = '\n';
+    }
+    const maximum_canonical = try canonicalizeEditorSource(allocator, maximum_transport);
+    try std.testing.expectEqual(maximum_source_bytes, maximum_canonical.len);
+    try std.testing.expect(std.mem.allEqual(u8, maximum_canonical, '\n'));
+
+    const oversized_transport = try allocator.alloc(u8, maximum_transported_source_bytes + 1);
+    @memset(oversized_transport, '\r');
+    try std.testing.expectError(error.SourceTooLarge, canonicalizeEditorSource(allocator, oversized_transport));
 }
 
 test "query filenames remain direct SQL leaves" {

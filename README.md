@@ -68,7 +68,7 @@ The Query page can keep ordinary `.sql` files beside the database-object navigat
 - JavaScript disabled: file lifecycle still works through ordinary forms, and Query executes the whole textarea when it contains exactly one statement.
 - A file may contain many statements, but one Run executes exactly one statement. Multi-statement selection and Run All are deliberately deferred.
 
-Files are limited to 64 KiB and valid UTF-8. Consistent LF and CRLF are preserved. Mixed or bare-CR line endings, NUL-containing files, invalid UTF-8, oversized files, symlinks, and non-regular files are never silently normalized or followed.
+Files are limited to 64 KiB and valid UTF-8. Browser-submitted CRLF transport is canonicalized back to the editor's LF representation. Existing files preserve consistent LF or CRLF on save. Mixed or bare-CR files, NUL-containing files, invalid UTF-8, oversized files, symlinks, and non-regular files are never silently normalized or followed.
 
 Every file page carries a SHA-256 revision. Save, Run, Rename, and Delete reject stale revisions; a conflict preserves the submitted browser buffer and never silently overwrites the disk file. Saves use same-directory atomic replacement and preserve the existing file permissions. Query files may remain editable even when the database itself is configured read-only; saving SQL never grants permission to execute a database write.
 

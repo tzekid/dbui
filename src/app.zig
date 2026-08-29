@@ -439,7 +439,7 @@ fn queryPost(
         return sourceFormError(context, request_context, configured, "query", request_id, err);
     };
     const fragment_requested = std.mem.eql(u8, fields.get("fragment") orelse "", "query-result");
-    const sql = fields.get("sql") orelse "";
+    const submitted_sql = fields.get("sql") orelse "";
     var database = sqlite.Database.open(request_context.arena, configured.path, configured.mode) catch |err| {
         return unavailable(context, request_context, configured, "query", request_id, err);
     };
@@ -453,6 +453,24 @@ fn queryPost(
     };
     var document = loadQueryWorkspace(request_context.arena, request_context.io, configured, fields, &sidebar) catch |err| {
         return queryWorkspaceError(context, request_context, configured, "query", request_id, err);
+    };
+    const sql = query_files.canonicalizeEditorSource(request_context.arena, submitted_sql) catch |err| {
+        std.log.warn("event=query_source_error database={s} error={s}", .{ configured.id, @errorName(err) });
+        return renderQueryFileFailure(
+            context,
+            request_context,
+            configured,
+            sidebar,
+            document,
+            submitted_sql,
+            submittedSourceErrorMessage(err),
+            .unprocessable_entity,
+            request_id,
+            false,
+            fields.get("file") != null,
+            fields.get("new_name") orelse "",
+            "query",
+        );
     };
     var saved_before_run = false;
     if (fields.get("file")) |file_name| {
@@ -1063,8 +1081,11 @@ fn readSourceForm(context: *Context, request_context: *web_app.RequestContext) !
     // receive state, so copy the two mutation-boundary values first.
     const origin = if (request.header(request_context.request, "origin")) |value| try request_context.arena.dupe(u8, value) else null;
     const host = if (request.header(request_context.request, "host")) |value| try request_context.arena.dupe(u8, value) else null;
-    const encoded = try request.readBodyAlloc(request_context.arena, request_context.request, 256 * 1024);
-    const fields = http_params.parseFormLimited(request_context.arena, encoded, 80 * 1024) catch return error.MalformedForm;
+    // A 64 KiB textarea can expand substantially when native form submission
+    // serializes LF as percent-encoded CRLF. These are transport bounds; the
+    // canonical SQL source remains limited to 64 KiB.
+    const encoded = try request.readBodyAlloc(request_context.arena, request_context.request, 512 * 1024);
+    const fields = http_params.parseFormLimited(request_context.arena, encoded, query_files.maximum_transported_source_bytes + 16 * 1024) catch return error.MalformedForm;
     if (!csrfValid(context.csrf_token, fields.get("csrf_token") orelse "") or !originMatchesHost(origin, host)) return error.InvalidFormToken;
     return fields;
 }
@@ -1085,7 +1106,7 @@ fn sourceFormError(
     };
     if (err == error.BodyTooLarge or err == error.UnsupportedFormType) request_context.request.head.keep_alive = false;
     const message = switch (err) {
-        error.BodyTooLarge => "The encoded form body exceeds 256 KiB.",
+        error.BodyTooLarge => "The encoded form body exceeds 512 KiB.",
         error.InvalidFormToken => "The form token or request origin is invalid. Reload the page and try again.",
         error.UnsupportedFormType => "Use an ordinary URL-encoded form submission.",
         else => "The form is malformed, ambiguous, or exceeds the decoded source boundary.",
@@ -1303,6 +1324,16 @@ fn queryFileErrorMessage(err: anyerror) []const u8 {
         error.NoSpaceLeft, error.DiskQuota => "The SQL file could not be saved because the filesystem has no available space.",
         error.AccessDenied, error.PermissionDenied, error.ReadOnlyFileSystem => "The configured query directory is not writable by dbui.",
         else => "The SQL file operation could not be completed.",
+    };
+}
+
+fn submittedSourceErrorMessage(err: anyerror) []const u8 {
+    return switch (err) {
+        error.SourceTooLarge => "SQL source is limited to 64 KiB.",
+        error.InvalidUtf8 => "SQL source must contain valid UTF-8.",
+        error.ContainsNul => "SQL source cannot contain NUL bytes.",
+        error.UnsupportedLineEndings => "SQL source contains mixed or bare-CR line endings.",
+        else => "The submitted SQL source is invalid.",
     };
 }
 

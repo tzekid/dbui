@@ -150,6 +150,14 @@ status=$(curl --silent --data-urlencode "csrf_token=$csrf" --data-urlencode 'new
 [[ $(cat "$queries_dir/daily-health.sql") == 'SELECT 2;' ]]
 grep -qi '^location: /db/fixture/query?file=daily-health.sql.*created=1' "$runtime_dir/create.headers"
 
+status=$(curl --silent --data-urlencode "csrf_token=$csrf" --data-urlencode 'new_name=native-newlines.sql' --data-urlencode $'sql=SELECT 1;\r\nSELECT 2;\r\n' http://127.0.0.1:17432/db/fixture/query/file/create -o "$runtime_dir/native-create.html" -w '%{http_code}')
+[[ $status == 303 ]]
+[[ $(od -An -tx1 "$queries_dir/native-newlines.sql" | tr -d ' \n') == '53454c45435420313b0a53454c45435420323b0a' ]]
+status=$(curl --silent --data-urlencode "csrf_token=$csrf" --data-urlencode 'new_name=mixed-newlines.sql' --data-urlencode $'sql=SELECT 1;\r\nSELECT 2;\n' http://127.0.0.1:17432/db/fixture/query/file/create -o "$runtime_dir/mixed-create.html" -w '%{http_code}')
+[[ $status == 422 ]]
+grep -qi 'mixed or bare-CR' "$runtime_dir/mixed-create.html"
+[[ ! -e "$queries_dir/mixed-newlines.sql" ]]
+
 curl --silent --fail 'http://127.0.0.1:17432/db/fixture/query?file=daily-health.sql' -o "$runtime_dir/file.html"
 base_revision=$(sed -n 's/.*name="base_revision" value="\([0-9a-f]*\)".*/\1/p' "$runtime_dir/file.html" | head -1)
 [[ ${#base_revision} -eq 64 ]]
@@ -159,10 +167,10 @@ status=$(curl --silent --data-urlencode "csrf_token=$csrf" --data-urlencode 'fil
 
 curl --silent --fail 'http://127.0.0.1:17432/db/fixture/query?file=crlf.sql' -o "$runtime_dir/crlf.html"
 crlf_revision=$(sed -n 's/.*name="base_revision" value="\([0-9a-f]*\)".*/\1/p' "$runtime_dir/crlf.html" | head -1)
-status=$(curl --silent --data-urlencode "csrf_token=$csrf" --data-urlencode 'file=crlf.sql' --data-urlencode "base_revision=$crlf_revision" --data-urlencode $'sql=SELECT 4;\n' --data-urlencode 'fragment=save-state' http://127.0.0.1:17432/db/fixture/query/file/save -o "$runtime_dir/crlf-save.html" -D "$runtime_dir/crlf-save.headers" -w '%{http_code}')
+status=$(curl --silent --data-urlencode "csrf_token=$csrf" --data-urlencode 'file=crlf.sql' --data-urlencode "base_revision=$crlf_revision" --data-urlencode $'sql=SELECT 4;\r\n' --data-urlencode 'fragment=save-state' http://127.0.0.1:17432/db/fixture/query/file/save -o "$runtime_dir/crlf-save.html" -D "$runtime_dir/crlf-save.headers" -w '%{http_code}')
 [[ $status == 200 ]]
 grep -qi '^etag: "[0-9a-f]\{64\}"' "$runtime_dir/crlf-save.headers"
-od -An -tx1 "$queries_dir/crlf.sql" | grep -q '0d 0a'
+[[ $(od -An -tx1 "$queries_dir/crlf.sql" | tr -d ' \n') == '53454c45435420343b0d0a' ]]
 
 curl --silent --fail 'http://127.0.0.1:17432/db/fixture/query?file=daily-health.sql' -o "$runtime_dir/pre-conflict.html"
 stale_revision=$(sed -n 's/.*name="base_revision" value="\([0-9a-f]*\)".*/\1/p' "$runtime_dir/pre-conflict.html" | head -1)
@@ -199,9 +207,10 @@ status=$(curl --silent --data-urlencode "csrf_token=$csrf" --data-urlencode 'fil
 [[ ! -e "$queries_dir/renamed.sql" ]]
 
 multi_sql=$'SELECT 11 AS first;\nSELECT 22 AS second;'
+browser_multi_sql=$'SELECT 11 AS first;\r\nSELECT 22 AS second;'
 selection_start=$(printf '%s' $'SELECT 11 AS first;\n' | wc -c)
 selection_end=$(printf '%s' "$multi_sql" | wc -c)
-status=$(curl --silent --data-urlencode "csrf_token=$csrf" --data-urlencode "sql=$multi_sql" --data-urlencode 'scope=selection' --data-urlencode "selection_start_byte=$selection_start" --data-urlencode "selection_end_byte=$selection_end" --data-urlencode 'cursor_byte=0' --data-urlencode 'fragment=query-result' http://127.0.0.1:17432/db/fixture/query -o "$runtime_dir/selection.html" -w '%{http_code}')
+status=$(curl --silent --data-urlencode "csrf_token=$csrf" --data-urlencode "sql=$browser_multi_sql" --data-urlencode 'scope=selection' --data-urlencode "selection_start_byte=$selection_start" --data-urlencode "selection_end_byte=$selection_end" --data-urlencode 'cursor_byte=0' --data-urlencode 'fragment=query-result' http://127.0.0.1:17432/db/fixture/query -o "$runtime_dir/selection.html" -w '%{http_code}')
 [[ $status == 200 ]]
 grep -q 'second' "$runtime_dir/selection.html"
 if grep -q 'first' "$runtime_dir/selection.html"; then
