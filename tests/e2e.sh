@@ -76,8 +76,31 @@ curl --silent --fail --dump-header "$runtime_dir/headers" http://127.0.0.1:17432
 grep -qi '^content-security-policy:' "$runtime_dir/headers"
 grep -qi '^cache-control: no-store' "$runtime_dir/headers"
 grep -q 'Fixture read-only' "$runtime_dir/index.html"
-grep -q 'href="/assets/app.css?v=2"' "$runtime_dir/index.html"
+grep -q 'href="/assets/app.css?v=3"' "$runtime_dir/index.html"
 grep -q 'src="/assets/app.js?v=2"' "$runtime_dir/index.html"
+
+mv "$ro_db" "$runtime_dir/fixture-ro.offline"
+curl --silent --fail http://127.0.0.1:17432/ -o "$runtime_dir/index-unavailable.html"
+grep -q 'Fixture read-only' "$runtime_dir/index-unavailable.html"
+grep -q 'The configured file cannot be opened right now.' "$runtime_dir/index-unavailable.html"
+grep -q '>UNAVAILABLE</span>' "$runtime_dir/index-unavailable.html"
+curl --silent --fail http://127.0.0.1:17432/db/fixture -o "$runtime_dir/overview-while-peer-unavailable.html"
+status=$(curl --silent http://127.0.0.1:17432/db/fixture_ro -o "$runtime_dir/overview-unavailable.html" -w '%{http_code}')
+[[ $status == 503 ]]
+mv "$runtime_dir/fixture-ro.offline" "$ro_db"
+curl --silent --fail http://127.0.0.1:17432/db/fixture_ro -o "$runtime_dir/overview-recovered.html"
+grep -q 'Fixture read-only' "$runtime_dir/overview-recovered.html"
+
+mv "$ro_db" "$runtime_dir/fixture-ro.valid"
+printf 'not a SQLite database\n' >"$ro_db"
+curl --silent --fail http://127.0.0.1:17432/ -o "$runtime_dir/index-invalid.html"
+grep -q 'Fixture read-only' "$runtime_dir/index-invalid.html"
+grep -q '>UNAVAILABLE</span>' "$runtime_dir/index-invalid.html"
+status=$(curl --silent http://127.0.0.1:17432/db/fixture_ro -o "$runtime_dir/overview-invalid.html" -w '%{http_code}')
+[[ $status == 503 ]]
+mv "$ro_db" "$runtime_dir/fixture-ro.invalid"
+mv "$runtime_dir/fixture-ro.valid" "$ro_db"
+curl --silent --fail http://127.0.0.1:17432/db/fixture_ro -o "$runtime_dir/overview-recovered-again.html"
 
 curl --silent --fail 'http://127.0.0.1:17432/db/fixture/data?object=users&size=25' -o "$runtime_dir/data.html"
 grep -q '<details class="sidebar-disclosure" open>' "$runtime_dir/data.html"
@@ -101,7 +124,7 @@ grep -q 'No rows match this view' "$runtime_dir/empty.html"
 [[ $(grep -o 'No rows' "$runtime_dir/empty.html" | wc -l) -eq 1 ]]
 curl --silent --fail http://127.0.0.1:17432/db/fixture -o "$runtime_dir/overview.html"
 rg -q '<time datetime="[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z">[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2} UTC</time>' "$runtime_dir/overview.html"
-curl --silent --fail --dump-header "$runtime_dir/asset-headers" 'http://127.0.0.1:17432/assets/app.css?v=2' -o "$runtime_dir/app.css"
+curl --silent --fail --dump-header "$runtime_dir/asset-headers" 'http://127.0.0.1:17432/assets/app.css?v=3' -o "$runtime_dir/app.css"
 grep -qi '^cache-control: no-store' "$runtime_dir/asset-headers"
 if grep -Fq '.sidebar-disclosure:not([open]) > .sidebar-body { display: block; }' "$runtime_dir/app.css"; then
     echo 'closed sidebar content override returned' >&2
@@ -242,6 +265,10 @@ wait "$server_pid"
 server_pid=
 if grep -q 'e2e_secret_sql_literal' "$runtime_dir/server.log"; then
     echo 'SQL source leaked into the server log' >&2
+    exit 1
+fi
+if grep -q 'event=request_error' "$runtime_dir/server.log"; then
+    echo 'acceptance journey produced an unexpected internal error' >&2
     exit 1
 fi
 grep -q 'event=server_stop' "$runtime_dir/server.log"

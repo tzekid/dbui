@@ -152,7 +152,7 @@ fn dispatch(context: *Context, request_context: *web_app.RequestContext, request
         },
         .matched => |matched| {
             const database_id = matched.params.get("database_id") orelse "-";
-            return switch (matched.route.handler) {
+            const outcome = switch (matched.route.handler) {
                 .index => index(context, request_context),
                 .health => health(request_context),
                 .asset_css => asset(request_context, app_css, "text/css; charset=utf-8", "asset_css"),
@@ -171,6 +171,13 @@ fn dispatch(context: *Context, request_context: *web_app.RequestContext, request
                 .row_update => rowUpdate(context, request_context, database_id, request_id),
                 .row_delete => rowDelete(context, request_context, database_id, request_id),
             };
+            return outcome catch |err| {
+                if (err == error.InvalidDatabase) {
+                    const configured = context.registry.find(database_id) orelse return err;
+                    return unavailable(context, request_context, configured, @tagName(matched.route.handler), request_id, err);
+                }
+                return err;
+            };
         },
     }
 }
@@ -183,19 +190,34 @@ fn index(context: *Context, request_context: *web_app.RequestContext) !Outcome {
     }
     const summaries = try request_context.arena.alloc(views.DatabaseSummary, context.registry.databases.len);
     for (context.registry.databases, 0..) |*configured, index_value| {
-        var database = try sqlite.Database.open(request_context.arena, configured.path, configured.mode);
-        defer database.deinit();
-        const stat = try std.Io.Dir.cwd().statFile(request_context.io, configured.path, .{ .follow_symlinks = true });
-        summaries[index_value] = .{
-            .database = configured,
-            .file_size = stat.size,
-            .modified_seconds = stat.mtime.toSeconds(),
-            .overview = try schema.loadOverview(request_context.arena, &database),
+        const details = loadIndexSummary(request_context.arena, request_context.io, configured) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => {
+                std.log.warn("event=database_summary database={s} state=unavailable error={s}", .{ configured.id, @errorName(err) });
+                summaries[index_value] = .{ .database = configured, .details = null };
+                continue;
+            },
         };
+        summaries[index_value] = .{ .database = configured, .details = details };
     }
     const body = try views.databaseIndex(request_context.arena, context.registry, summaries);
     try respondHtml(request_context.request, body, .ok);
     return .{ .status = .ok, .route_name = "database_index" };
+}
+
+fn loadIndexSummary(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    configured: *const config.DatabaseConfig,
+) !views.DatabaseSummary.Details {
+    var database = try sqlite.Database.open(allocator, configured.path, configured.mode);
+    defer database.deinit();
+    const stat = try std.Io.Dir.cwd().statFile(io, configured.path, .{ .follow_symlinks = true });
+    return .{
+        .file_size = stat.size,
+        .modified_seconds = stat.mtime.toSeconds(),
+        .overview = try schema.loadOverview(allocator, &database),
+    };
 }
 
 fn overview(
@@ -1363,7 +1385,7 @@ fn unavailable(
     request_id: u64,
     err: anyerror,
 ) !Outcome {
-    std.log.err("event=sqlite_open database={s} error={s}", .{ configured.id, @errorName(err) });
+    std.log.err("event=database_unavailable database={s} error={s}", .{ configured.id, @errorName(err) });
     try problem(context, request_context, configured, .service_unavailable, "Database unavailable", "The configured database cannot be opened right now.", request_id);
     return .{ .status = .service_unavailable, .database_id = configured.id, .route_name = route_name };
 }

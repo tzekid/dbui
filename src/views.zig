@@ -21,9 +21,13 @@ pub const Sidebar = struct {
 
 pub const DatabaseSummary = struct {
     database: *const config.DatabaseConfig,
-    file_size: u64,
-    modified_seconds: i64,
-    overview: schema.Overview,
+    details: ?Details,
+
+    pub const Details = struct {
+        file_size: u64,
+        modified_seconds: i64,
+        overview: schema.Overview,
+    };
 };
 
 pub const OverviewPage = struct {
@@ -121,13 +125,18 @@ pub fn databaseIndex(
         try writer.writeAll("\">");
         try html.text(writer, item.database.label);
         try writer.writeAll("</a></h2><p class=\"meta\">");
-        try writer.print("{d} tables · {d} views · ", .{ item.overview.tables, item.overview.views });
-        try writeSize(writer, item.file_size);
-        try writer.writeAll(" · Modified ");
-        try writeModifiedTime(writer, item.modified_seconds);
-        try writer.writeAll("</p></div>");
+        if (item.details) |details| {
+            try writer.print("{d} tables · {d} views · ", .{ details.overview.tables, details.overview.views });
+            try writeSize(writer, details.file_size);
+            try writer.writeAll(" · Modified ");
+            try writeModifiedTime(writer, details.modified_seconds);
+        } else {
+            try writer.writeAll("The configured file cannot be opened right now.");
+        }
+        try writer.writeAll("</p></div><div class=\"database-badges\">");
         try modeBadge(writer, item.database);
-        try writer.writeAll("</article>");
+        if (item.details == null) try writer.writeAll("<span class=\"availability availability--unavailable\">UNAVAILABLE</span>");
+        try writer.writeAll("</div></article>");
     }
     try writer.writeAll("</div></main>");
     try shellEnd(writer);
@@ -1007,7 +1016,7 @@ fn shellStart(
     // asset responses are no-store so later deployments cannot go stale again.
     try html.documentStart(writer, .{
         .title = title,
-        .head = .audited("<link rel=\"icon\" href=\"data:,\"><link rel=\"stylesheet\" href=\"/assets/app.css?v=2\"><script src=\"/assets/app.js?v=2\" defer></script>"),
+        .head = .audited("<link rel=\"icon\" href=\"data:,\"><link rel=\"stylesheet\" href=\"/assets/app.css?v=3\"><script src=\"/assets/app.js?v=2\" defer></script>"),
     });
     try writer.writeAll("<header class=\"topbar\"><a class=\"brand\" href=\"/\">dbui</a>");
     if (current) |database| {
