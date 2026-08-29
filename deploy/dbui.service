@@ -38,7 +38,7 @@ SystemCallArchitectures=native
 
 # Replace these examples with the exact configured files/directories.
 ReadOnlyPaths=/srv/cloudio/data
-ReadWritePaths=/srv/analytico/data
+ReadWritePaths=/srv/analytico/data /srv/dbui/queries
 
 [Install]
 WantedBy=multi-user.target

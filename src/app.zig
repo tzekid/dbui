@@ -9,6 +9,7 @@ const schema = @import("schema.zig");
 const browse = @import("browse.zig");
 const http_params = @import("http_params.zig");
 const query_mod = @import("query.zig");
+const query_files = @import("query_files.zig");
 const mutate = @import("mutate.zig");
 const views = @import("views.zig");
 
@@ -31,6 +32,10 @@ const Handler = enum {
     schema,
     query_get,
     query_post,
+    query_file_create,
+    query_file_save,
+    query_file_rename,
+    query_file_delete,
     row,
     row_edit,
     row_update,
@@ -53,6 +58,10 @@ const routes = [_]Route{
     .{ .method = .GET, .pattern = "/db/:database_id/schema", .handler = .schema },
     .{ .method = .GET, .pattern = "/db/:database_id/query", .handler = .query_get },
     .{ .method = .POST, .pattern = "/db/:database_id/query", .handler = .query_post },
+    .{ .method = .POST, .pattern = "/db/:database_id/query/file/create", .handler = .query_file_create },
+    .{ .method = .POST, .pattern = "/db/:database_id/query/file/save", .handler = .query_file_save },
+    .{ .method = .POST, .pattern = "/db/:database_id/query/file/rename", .handler = .query_file_rename },
+    .{ .method = .POST, .pattern = "/db/:database_id/query/file/delete", .handler = .query_file_delete },
     .{ .method = .GET, .pattern = "/db/:database_id/row", .handler = .row },
     .{ .method = .GET, .pattern = "/db/:database_id/row/edit", .handler = .row_edit },
     .{ .method = .POST, .pattern = "/db/:database_id/row/update", .handler = .row_update },
@@ -153,6 +162,10 @@ fn dispatch(context: *Context, request_context: *web_app.RequestContext, request
                 .schema => schemaPage(context, request_context, target, database_id, request_id),
                 .query_get => queryGet(context, request_context, target, database_id, request_id),
                 .query_post => queryPost(context, request_context, target, database_id, request_id),
+                .query_file_create => queryFileCreate(context, request_context, database_id, request_id),
+                .query_file_save => queryFileSave(context, request_context, database_id, request_id),
+                .query_file_rename => queryFileRename(context, request_context, database_id, request_id),
+                .query_file_delete => queryFileDelete(context, request_context, database_id, request_id),
                 .row => rowGet(context, request_context, target, database_id, request_id),
                 .row_edit => rowEdit(context, request_context, target, database_id, request_id),
                 .row_update => rowUpdate(context, request_context, database_id, request_id),
@@ -365,18 +378,24 @@ fn queryGet(
         return unavailable(context, request_context, configured, "query", request_id, err);
     };
     defer database.deinit();
-    const sidebar = loadSidebar(request_context.arena, &database, configured, parameters, null) catch |err| {
+    var sidebar = loadSidebar(request_context.arena, &database, configured, parameters, null) catch |err| {
         if (err == error.SearchTooLong) {
             try problem(context, request_context, configured, .bad_request, "Search too long", "Object search is limited to 256 bytes.", request_id);
             return .{ .status = .bad_request, .database_id = configured.id, .route_name = "query" };
         }
         return err;
     };
+    const document = loadQueryWorkspace(request_context.arena, request_context.io, configured, parameters, &sidebar) catch |err| {
+        return queryWorkspaceError(context, request_context, configured, "query", request_id, err);
+    };
     const body = try views.queryPage(request_context.arena, .{
         .registry = context.registry,
         .database = configured,
         .sidebar = sidebar,
         .csrf_token = &context.csrf_token,
+        .document = document,
+        .sql = if (document) |value| value.source else "",
+        .notice = queryNotice(parameters),
     });
     try respondHtml(request_context.request, body, .ok);
     return .{ .status = .ok, .database_id = configured.id, .route_name = "query" };
@@ -394,68 +413,160 @@ fn queryPost(
         try problem(context, request_context, null, .not_found, "Database not found", "That database is not configured.", request_id);
         return .{ .status = .not_found, .database_id = database_id, .route_name = "query" };
     };
-    if (!formContentType(request.header(request_context.request, "content-type") orelse "")) {
-        request_context.request.head.keep_alive = false;
-        try problem(context, request_context, configured, .unsupported_media_type, "Unsupported form", "Use an ordinary URL-encoded form submission.", request_id);
-        return .{ .status = .unsupported_media_type, .database_id = configured.id, .route_name = "query" };
-    }
-    // std.http header slices belong to the received-head state. Copy the two
-    // mutation-boundary headers before body consumption advances that state.
-    const origin = if (request.header(request_context.request, "origin")) |value|
-        try request_context.arena.dupe(u8, value)
-    else
-        null;
-    const host = if (request.header(request_context.request, "host")) |value|
-        try request_context.arena.dupe(u8, value)
-    else
-        null;
-    const encoded = request.readBodyAlloc(request_context.arena, request_context.request, 128 * 1024) catch |err| switch (err) {
-        error.BodyTooLarge => {
-            request_context.request.head.keep_alive = false;
-            try problem(context, request_context, configured, .payload_too_large, "Request too large", "The form body exceeds 128 KiB.", request_id);
-            return .{ .status = .payload_too_large, .database_id = configured.id, .route_name = "query" };
-        },
-        else => return err,
+    const fields = readSourceForm(context, request_context) catch |err| {
+        return sourceFormError(context, request_context, configured, "query", request_id, err);
     };
-    const fields = http_params.parseForm(request_context.arena, encoded) catch {
-        try problem(context, request_context, configured, .bad_request, "Invalid form", "The form is malformed or ambiguous.", request_id);
-        return .{ .status = .bad_request, .database_id = configured.id, .route_name = "query" };
-    };
-    if (!csrfValid(context.csrf_token, fields.get("csrf_token") orelse "") or !originMatchesHost(origin, host)) {
-        try problem(context, request_context, configured, .forbidden, "Request rejected", "The form token or request origin is invalid. Reload the page and try again.", request_id);
-        return .{ .status = .forbidden, .database_id = configured.id, .route_name = "query" };
-    }
+    const fragment_requested = std.mem.eql(u8, fields.get("fragment") orelse "", "query-result");
     const sql = fields.get("sql") orelse "";
     var database = sqlite.Database.open(request_context.arena, configured.path, configured.mode) catch |err| {
         return unavailable(context, request_context, configured, "query", request_id, err);
     };
     defer database.deinit();
-    const sidebar = loadSidebar(request_context.arena, &database, configured, fields, null) catch |err| {
+    var sidebar = loadSidebar(request_context.arena, &database, configured, fields, null) catch |err| {
         if (err == error.SearchTooLong) {
             try problem(context, request_context, configured, .bad_request, "Search too long", "Object search is limited to 256 bytes.", request_id);
             return .{ .status = .bad_request, .database_id = configured.id, .route_name = "query" };
         }
         return err;
     };
+    var document = loadQueryWorkspace(request_context.arena, request_context.io, configured, fields, &sidebar) catch |err| {
+        return queryWorkspaceError(context, request_context, configured, "query", request_id, err);
+    };
+    var saved_before_run = false;
+    if (fields.get("file")) |file_name| {
+        const workspace_path = configured.queries_path orelse {
+            return queryWorkspaceError(context, request_context, configured, "query", request_id, error.QueryWorkspaceUnavailable);
+        };
+        if (document == null or !document.?.editable()) {
+            return renderQueryFileFailure(context, request_context, configured, sidebar, document, sql, "This SQL file cannot be edited in dbui.", .unprocessable_entity, request_id, false, false, "", "query");
+        }
+        const base_revision = fields.get("base_revision") orelse "";
+        const saved = query_files.save(
+            request_context.arena,
+            request_context.io,
+            workspace_path,
+            file_name,
+            base_revision,
+            sql,
+        ) catch |err| {
+            if (err == error.FileConflict) {
+                var conflict_document = document.?;
+                conflict_document.source = sql;
+                if (formRevision(base_revision)) |revision| conflict_document.revision = revision;
+                return renderQueryFileFailure(
+                    context,
+                    request_context,
+                    configured,
+                    sidebar,
+                    conflict_document,
+                    sql,
+                    "The file changed on disk. Your edits were not saved or executed.",
+                    .conflict,
+                    request_id,
+                    true,
+                    true,
+                    "",
+                    "query",
+                );
+            }
+            return renderQueryFileFailure(
+                context,
+                request_context,
+                configured,
+                sidebar,
+                document,
+                sql,
+                queryFileErrorMessage(err),
+                queryFileErrorStatus(err),
+                request_id,
+                false,
+                true,
+                "",
+                "query",
+            );
+        };
+        saved_before_run = saved.changed;
+        document = query_files.load(request_context.arena, request_context.io, workspace_path, file_name) catch |err| {
+            return queryWorkspaceError(context, request_context, configured, "query", request_id, err);
+        };
+        sidebar.current_file = file_name;
+    }
+    const scope = query_mod.Scope.parse(fields.get("scope") orelse "whole") catch {
+        return renderQueryExecutionFailure(context, request_context, configured, &database, sidebar, document, sql, saved_before_run, error.InvalidExecutionScope, .whole, 0, 0, 0, request_id, fragment_requested);
+    };
+    const selection_start = parseFormOffset(fields.get("selection_start_byte") orelse "0") catch {
+        return renderQueryExecutionFailure(context, request_context, configured, &database, sidebar, document, sql, saved_before_run, error.InvalidSourceOffset, scope, 0, 0, 0, request_id, fragment_requested);
+    };
+    const selection_end = parseFormOffset(fields.get("selection_end_byte") orelse "0") catch {
+        return renderQueryExecutionFailure(context, request_context, configured, &database, sidebar, document, sql, saved_before_run, error.InvalidSourceOffset, scope, selection_start, 0, 0, request_id, fragment_requested);
+    };
+    const cursor = parseFormOffset(fields.get("cursor_byte") orelse "0") catch {
+        return renderQueryExecutionFailure(context, request_context, configured, &database, sidebar, document, sql, saved_before_run, error.InvalidSourceOffset, scope, selection_start, selection_end, 0, request_id, fragment_requested);
+    };
+    try database.installQueryAuthorizer();
+    const resolved = query_mod.resolveSource(
+        request_context.arena,
+        &database,
+        sql,
+        scope,
+        selection_start,
+        selection_end,
+        cursor,
+    ) catch |err| {
+        return renderQueryExecutionFailure(context, request_context, configured, &database, sidebar, document, sql, saved_before_run, err, scope, selection_start, selection_end, cursor, request_id, fragment_requested);
+    };
     const confirmed = std.mem.eql(u8, fields.get("confirm_write") orelse "", "1");
-    const action = query_mod.execute(request_context.arena, request_context.io, &database, sql, confirmed) catch |err| {
+    const action = query_mod.execute(request_context.arena, request_context.io, &database, resolved.sql, confirmed) catch |err| {
         const status: std.http.Status = queryErrorStatus(err);
         std.log.warn(
             "event=sqlite_query_error database={s} primary={d} extended={d} error={s}",
             .{ configured.id, database.primaryCode(), database.extendedCode(), @errorName(err) },
         );
         const message = try queryErrorMessage(request_context.arena, &database, err);
+        if (fragment_requested) {
+            const fragment = try views.queryFragment(request_context.arena, .{
+                .error_message = message,
+                .saved_before_run = saved_before_run,
+            });
+            try respondQueryFragment(request_context, fragment, queryErrorStatus(err), document);
+            return .{ .status = queryErrorStatus(err), .database_id = configured.id, .route_name = "query" };
+        }
         const body = try views.queryPage(request_context.arena, .{
             .registry = context.registry,
             .database = configured,
             .sidebar = sidebar,
             .csrf_token = &context.csrf_token,
             .sql = sql,
+            .document = document,
             .error_message = message,
+            .saved_before_run = saved_before_run,
+            .notice = if (saved_before_run) "SQL file saved before execution." else null,
+            .scope = scope,
+            .selection_start_byte = selection_start,
+            .selection_end_byte = selection_end,
+            .cursor_byte = cursor,
         });
         try respondHtml(request_context.request, body, status);
         return .{ .status = status, .database_id = configured.id, .route_name = "query" };
     };
+    if (fragment_requested) {
+        const fragment = switch (action) {
+            .confirmation_required => try views.queryFragment(request_context.arena, .{
+                .confirmation_required = true,
+                .saved_before_run = saved_before_run,
+            }),
+            .result => |result| try views.queryFragment(request_context.arena, .{
+                .result = result,
+                .result_context = .{
+                    .file_name = fields.get("file"),
+                    .line_start = resolved.line_start,
+                    .line_end = resolved.line_end,
+                },
+            }),
+        };
+        try respondQueryFragment(request_context, fragment, .ok, document);
+        return .{ .status = .ok, .database_id = configured.id, .route_name = "query" };
+    }
     const body = switch (action) {
         .confirmation_required => try views.queryPage(request_context.arena, .{
             .registry = context.registry,
@@ -463,7 +574,13 @@ fn queryPost(
             .sidebar = sidebar,
             .csrf_token = &context.csrf_token,
             .sql = sql,
+            .document = document,
             .confirmation_required = true,
+            .saved_before_run = saved_before_run,
+            .scope = scope,
+            .selection_start_byte = selection_start,
+            .selection_end_byte = selection_end,
+            .cursor_byte = cursor,
         }),
         .result => |result| try views.queryPage(request_context.arena, .{
             .registry = context.registry,
@@ -471,11 +588,187 @@ fn queryPost(
             .sidebar = sidebar,
             .csrf_token = &context.csrf_token,
             .sql = sql,
+            .document = document,
             .result = result,
+            .result_context = .{
+                .file_name = fields.get("file"),
+                .line_start = resolved.line_start,
+                .line_end = resolved.line_end,
+            },
+            .saved_before_run = saved_before_run,
+            .scope = scope,
+            .selection_start_byte = selection_start,
+            .selection_end_byte = selection_end,
+            .cursor_byte = cursor,
         }),
     };
     try respondHtml(request_context.request, body, .ok);
     return .{ .status = .ok, .database_id = configured.id, .route_name = "query" };
+}
+
+fn queryFileCreate(
+    context: *Context,
+    request_context: *web_app.RequestContext,
+    database_id: []const u8,
+    request_id: u64,
+) !Outcome {
+    const configured = context.registry.find(database_id) orelse {
+        request_context.request.head.keep_alive = false;
+        try problem(context, request_context, null, .not_found, "Database not found", "That database is not configured.", request_id);
+        return .{ .status = .not_found, .database_id = database_id, .route_name = "query_file_create" };
+    };
+    const workspace_path = configured.queries_path orelse {
+        request_context.request.head.keep_alive = false;
+        try problem(context, request_context, configured, .not_found, "SQL files unavailable", "This database has no configured query directory.", request_id);
+        return .{ .status = .not_found, .database_id = configured.id, .route_name = "query_file_create" };
+    };
+    const fields = readSourceForm(context, request_context) catch |err| {
+        return sourceFormError(context, request_context, configured, "query_file_create", request_id, err);
+    };
+    const name = fields.get("new_name") orelse "";
+    const source = fields.get("sql") orelse "";
+    _ = query_files.create(request_context.arena, request_context.io, workspace_path, name, source) catch |err| {
+        std.log.warn("event=query_file_error database={s} route=create error={s}", .{ configured.id, @errorName(err) });
+        return renderQueryFieldsFailure(
+            context,
+            request_context,
+            configured,
+            fields,
+            source,
+            queryFileErrorMessage(err),
+            queryFileErrorStatus(err),
+            request_id,
+            fields.get("file") != null,
+            "query_file_create",
+        );
+    };
+    try redirectQuery(request_context, configured.id, name, fields, "created");
+    return .{ .status = .see_other, .database_id = configured.id, .route_name = "query_file_create" };
+}
+
+fn queryFileSave(
+    context: *Context,
+    request_context: *web_app.RequestContext,
+    database_id: []const u8,
+    request_id: u64,
+) !Outcome {
+    const configured = context.registry.find(database_id) orelse {
+        request_context.request.head.keep_alive = false;
+        try problem(context, request_context, null, .not_found, "Database not found", "That database is not configured.", request_id);
+        return .{ .status = .not_found, .database_id = database_id, .route_name = "query_file_save" };
+    };
+    const workspace_path = configured.queries_path orelse {
+        request_context.request.head.keep_alive = false;
+        try problem(context, request_context, configured, .not_found, "SQL files unavailable", "This database has no configured query directory.", request_id);
+        return .{ .status = .not_found, .database_id = configured.id, .route_name = "query_file_save" };
+    };
+    const fields = readSourceForm(context, request_context) catch |err| {
+        return sourceFormError(context, request_context, configured, "query_file_save", request_id, err);
+    };
+    const name = fields.get("file") orelse "";
+    const source = fields.get("sql") orelse "";
+    const saved = query_files.save(
+        request_context.arena,
+        request_context.io,
+        workspace_path,
+        name,
+        fields.get("base_revision") orelse "",
+        source,
+    ) catch |err| {
+        std.log.warn("event=query_file_error database={s} route=save error={s}", .{ configured.id, @errorName(err) });
+        return renderQueryFieldsFailure(
+            context,
+            request_context,
+            configured,
+            fields,
+            source,
+            if (err == error.FileConflict) "The file changed on disk. Your edits were not saved." else queryFileErrorMessage(err),
+            queryFileErrorStatus(err),
+            request_id,
+            err == error.FileConflict,
+            "query_file_save",
+        );
+    };
+    if (std.mem.eql(u8, fields.get("fragment") orelse "", "save-state")) {
+        try respondSaveState(request_context, saved.revision);
+        return .{ .status = .ok, .database_id = configured.id, .route_name = "query_file_save" };
+    }
+    try redirectQuery(request_context, configured.id, name, fields, "saved");
+    return .{ .status = .see_other, .database_id = configured.id, .route_name = "query_file_save" };
+}
+
+fn queryFileRename(
+    context: *Context,
+    request_context: *web_app.RequestContext,
+    database_id: []const u8,
+    request_id: u64,
+) !Outcome {
+    const configured = context.registry.find(database_id) orelse {
+        request_context.request.head.keep_alive = false;
+        try problem(context, request_context, null, .not_found, "Database not found", "That database is not configured.", request_id);
+        return .{ .status = .not_found, .database_id = database_id, .route_name = "query_file_rename" };
+    };
+    const workspace_path = configured.queries_path orelse {
+        try problem(context, request_context, configured, .not_found, "SQL files unavailable", "This database has no configured query directory.", request_id);
+        return .{ .status = .not_found, .database_id = configured.id, .route_name = "query_file_rename" };
+    };
+    const fields = readMutationForm(context, request_context) catch |err| {
+        return mutationFormError(context, request_context, configured, "query_file_rename", request_id, err);
+    };
+    const old_name = fields.get("file") orelse "";
+    const new_name = fields.get("new_name") orelse "";
+    query_files.rename(
+        request_context.arena,
+        request_context.io,
+        workspace_path,
+        old_name,
+        new_name,
+        fields.get("base_revision") orelse "",
+    ) catch |err| {
+        std.log.warn("event=query_file_error database={s} route=rename error={s}", .{ configured.id, @errorName(err) });
+        try problem(context, request_context, configured, queryFileErrorStatus(err), "Rename failed", queryFileErrorMessage(err), request_id);
+        return .{ .status = queryFileErrorStatus(err), .database_id = configured.id, .route_name = "query_file_rename" };
+    };
+    try redirectQuery(request_context, configured.id, new_name, fields, "renamed");
+    return .{ .status = .see_other, .database_id = configured.id, .route_name = "query_file_rename" };
+}
+
+fn queryFileDelete(
+    context: *Context,
+    request_context: *web_app.RequestContext,
+    database_id: []const u8,
+    request_id: u64,
+) !Outcome {
+    const configured = context.registry.find(database_id) orelse {
+        request_context.request.head.keep_alive = false;
+        try problem(context, request_context, null, .not_found, "Database not found", "That database is not configured.", request_id);
+        return .{ .status = .not_found, .database_id = database_id, .route_name = "query_file_delete" };
+    };
+    const workspace_path = configured.queries_path orelse {
+        try problem(context, request_context, configured, .not_found, "SQL files unavailable", "This database has no configured query directory.", request_id);
+        return .{ .status = .not_found, .database_id = configured.id, .route_name = "query_file_delete" };
+    };
+    const fields = readMutationForm(context, request_context) catch |err| {
+        return mutationFormError(context, request_context, configured, "query_file_delete", request_id, err);
+    };
+    if (!std.mem.eql(u8, fields.get("confirm_delete") orelse "", "1")) {
+        try problem(context, request_context, configured, .unprocessable_entity, "Delete not confirmed", "Confirm the named SQL file before deleting it.", request_id);
+        return .{ .status = .unprocessable_entity, .database_id = configured.id, .route_name = "query_file_delete" };
+    }
+    const name = fields.get("file") orelse "";
+    query_files.delete(
+        request_context.arena,
+        request_context.io,
+        workspace_path,
+        name,
+        fields.get("base_revision") orelse "",
+    ) catch |err| {
+        std.log.warn("event=query_file_error database={s} route=delete error={s}", .{ configured.id, @errorName(err) });
+        try problem(context, request_context, configured, queryFileErrorStatus(err), "Delete failed", queryFileErrorMessage(err), request_id);
+        return .{ .status = queryFileErrorStatus(err), .database_id = configured.id, .route_name = "query_file_delete" };
+    };
+    try redirectQuery(request_context, configured.id, null, fields, "deleted");
+    return .{ .status = .see_other, .database_id = configured.id, .route_name = "query_file_delete" };
 }
 
 fn rowGet(
@@ -742,6 +1035,43 @@ fn readMutationForm(context: *Context, request_context: *web_app.RequestContext)
     return fields;
 }
 
+fn readSourceForm(context: *Context, request_context: *web_app.RequestContext) !http_params.Parameters {
+    if (!formContentType(request.header(request_context.request, "content-type") orelse "")) return error.UnsupportedFormType;
+    // Header slices are invalidated when body consumption advances the HTTP
+    // receive state, so copy the two mutation-boundary values first.
+    const origin = if (request.header(request_context.request, "origin")) |value| try request_context.arena.dupe(u8, value) else null;
+    const host = if (request.header(request_context.request, "host")) |value| try request_context.arena.dupe(u8, value) else null;
+    const encoded = try request.readBodyAlloc(request_context.arena, request_context.request, 256 * 1024);
+    const fields = http_params.parseFormLimited(request_context.arena, encoded, 80 * 1024) catch return error.MalformedForm;
+    if (!csrfValid(context.csrf_token, fields.get("csrf_token") orelse "") or !originMatchesHost(origin, host)) return error.InvalidFormToken;
+    return fields;
+}
+
+fn sourceFormError(
+    context: *Context,
+    request_context: *web_app.RequestContext,
+    configured: *const config.DatabaseConfig,
+    route_name: []const u8,
+    request_id: u64,
+    err: anyerror,
+) !Outcome {
+    const status: std.http.Status = switch (err) {
+        error.BodyTooLarge => .payload_too_large,
+        error.InvalidFormToken => .forbidden,
+        error.UnsupportedFormType => .unsupported_media_type,
+        else => .bad_request,
+    };
+    if (err == error.BodyTooLarge or err == error.UnsupportedFormType) request_context.request.head.keep_alive = false;
+    const message = switch (err) {
+        error.BodyTooLarge => "The encoded form body exceeds 256 KiB.",
+        error.InvalidFormToken => "The form token or request origin is invalid. Reload the page and try again.",
+        error.UnsupportedFormType => "Use an ordinary URL-encoded form submission.",
+        else => "The form is malformed, ambiguous, or exceeds the decoded source boundary.",
+    };
+    try problem(context, request_context, configured, status, "Query form rejected", message, request_id);
+    return .{ .status = status, .database_id = configured.id, .route_name = route_name };
+}
+
 fn mutationFormError(
     context: *Context,
     request_context: *web_app.RequestContext,
@@ -779,19 +1109,231 @@ fn mutationValueMessage(err: anyerror) []const u8 {
     };
 }
 
+fn loadQueryWorkspace(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    configured: *const config.DatabaseConfig,
+    parameters: http_params.Parameters,
+    sidebar: *views.Sidebar,
+) !?query_files.Document {
+    const file_name = parameters.get("file");
+    const workspace_path = configured.queries_path orelse {
+        if (file_name != null) return error.QueryWorkspaceUnavailable;
+        return null;
+    };
+    sidebar.query_files = try query_files.list(allocator, io, workspace_path);
+    if (file_name) |name| {
+        const document = try query_files.load(allocator, io, workspace_path, name);
+        sidebar.current_file = document.name;
+        return document;
+    }
+    return null;
+}
+
+fn queryNotice(parameters: http_params.Parameters) ?[]const u8 {
+    if (std.mem.eql(u8, parameters.get("created") orelse "", "1")) return "SQL file created.";
+    if (std.mem.eql(u8, parameters.get("saved") orelse "", "1")) return "SQL file saved.";
+    if (std.mem.eql(u8, parameters.get("renamed") orelse "", "1")) return "SQL file renamed.";
+    if (std.mem.eql(u8, parameters.get("deleted") orelse "", "1")) return "SQL file deleted.";
+    return null;
+}
+
+fn queryWorkspaceError(
+    context: *Context,
+    request_context: *web_app.RequestContext,
+    configured: *const config.DatabaseConfig,
+    route_name: []const u8,
+    request_id: u64,
+    err: anyerror,
+) !Outcome {
+    const status = queryFileErrorStatus(err);
+    try problem(context, request_context, configured, status, "SQL file unavailable", queryFileErrorMessage(err), request_id);
+    return .{ .status = status, .database_id = configured.id, .route_name = route_name };
+}
+
+fn renderQueryFieldsFailure(
+    context: *Context,
+    request_context: *web_app.RequestContext,
+    configured: *const config.DatabaseConfig,
+    fields: http_params.Parameters,
+    source: []const u8,
+    message: []const u8,
+    status: std.http.Status,
+    request_id: u64,
+    conflict: bool,
+    route_name: []const u8,
+) !Outcome {
+    var database = sqlite.Database.open(request_context.arena, configured.path, configured.mode) catch |err| {
+        return unavailable(context, request_context, configured, route_name, request_id, err);
+    };
+    defer database.deinit();
+    var sidebar = loadSidebar(request_context.arena, &database, configured, fields, null) catch |err| {
+        if (err == error.SearchTooLong) {
+            try problem(context, request_context, configured, .bad_request, "Search too long", "Object search is limited to 256 bytes.", request_id);
+            return .{ .status = .bad_request, .database_id = configured.id, .route_name = route_name };
+        }
+        return err;
+    };
+    var effective_conflict = conflict;
+    var document = loadQueryWorkspace(request_context.arena, request_context.io, configured, fields, &sidebar) catch |err| block: {
+        const file_name = fields.get("file") orelse {
+            return queryWorkspaceError(context, request_context, configured, route_name, request_id, err);
+        };
+        const revision = formRevision(fields.get("base_revision") orelse "") orelse {
+            return queryWorkspaceError(context, request_context, configured, route_name, request_id, err);
+        };
+        const workspace_path = configured.queries_path orelse {
+            return queryWorkspaceError(context, request_context, configured, route_name, request_id, err);
+        };
+        sidebar.query_files = query_files.list(request_context.arena, request_context.io, workspace_path) catch |list_err| {
+            return queryWorkspaceError(context, request_context, configured, route_name, request_id, list_err);
+        };
+        sidebar.current_file = file_name;
+        effective_conflict = true;
+        break :block query_files.Document{
+            .name = file_name,
+            .source = source,
+            .revision = revision,
+        };
+    };
+    if (effective_conflict) {
+        if (document) |*value| {
+            value.source = source;
+            if (formRevision(fields.get("base_revision") orelse "")) |revision| value.revision = revision;
+        }
+    }
+    return renderQueryFileFailure(
+        context,
+        request_context,
+        configured,
+        sidebar,
+        document,
+        source,
+        message,
+        status,
+        request_id,
+        effective_conflict,
+        fields.get("file") != null,
+        fields.get("new_name") orelse "",
+        route_name,
+    );
+}
+
+fn renderQueryFileFailure(
+    context: *Context,
+    request_context: *web_app.RequestContext,
+    configured: *const config.DatabaseConfig,
+    sidebar: views.Sidebar,
+    document: ?query_files.Document,
+    source: []const u8,
+    message: []const u8,
+    status: std.http.Status,
+    request_id: u64,
+    conflict: bool,
+    initial_unsaved: bool,
+    new_file_name: []const u8,
+    route_name: []const u8,
+) !Outcome {
+    _ = request_id;
+    const body = try views.queryPage(request_context.arena, .{
+        .registry = context.registry,
+        .database = configured,
+        .sidebar = sidebar,
+        .csrf_token = &context.csrf_token,
+        .sql = source,
+        .document = document,
+        .error_message = message,
+        .file_conflict = conflict,
+        .initial_unsaved = initial_unsaved,
+        .new_file_name = new_file_name,
+    });
+    try respondHtml(request_context.request, body, status);
+    return .{ .status = status, .database_id = configured.id, .route_name = route_name };
+}
+
+fn queryFileErrorStatus(err: anyerror) std.http.Status {
+    return switch (err) {
+        error.FileNotFound, error.QueryWorkspaceUnavailable, error.SymLinkLoop, error.FileNotRegular, error.IsDir => .not_found,
+        error.FileConflict, error.FileChangedDuringRead, error.PathAlreadyExists => .conflict,
+        error.InvalidFilename, error.InvalidRevision => .bad_request,
+        error.SourceTooLarge, error.InvalidUtf8, error.ContainsNul, error.UnsupportedLineEndings, error.FileNotEditable, error.FileTooLarge, error.TooManyWorkspaceEntries, error.TooManyQueryFiles => .unprocessable_entity,
+        error.NoSpaceLeft, error.DiskQuota => .insufficient_storage,
+        error.AccessDenied, error.PermissionDenied, error.ReadOnlyFileSystem => .service_unavailable,
+        else => .internal_server_error,
+    };
+}
+
+fn queryFileErrorMessage(err: anyerror) []const u8 {
+    return switch (err) {
+        error.QueryWorkspaceUnavailable => "This database has no configured query directory.",
+        error.FileNotFound, error.SymLinkLoop, error.FileNotRegular, error.IsDir => "That SQL file no longer exists.",
+        error.FileConflict, error.FileChangedDuringRead => "The SQL file changed on disk. Reload it before making another change.",
+        error.PathAlreadyExists => "A SQL file with that name already exists.",
+        error.InvalidFilename => "Use a direct UTF-8 filename ending in .sql, with at most 80 bytes and no path separators or control characters.",
+        error.InvalidRevision => "The SQL file revision is malformed. Reload the page and try again.",
+        error.SourceTooLarge, error.FileTooLarge => "SQL files are limited to 64 KiB.",
+        error.InvalidUtf8 => "SQL files must contain valid UTF-8.",
+        error.ContainsNul => "SQL files cannot contain NUL bytes.",
+        error.UnsupportedLineEndings => "Mixed or bare-CR line endings are not editable in dbui.",
+        error.FileNotEditable => "This SQL file cannot be edited in dbui.",
+        error.TooManyWorkspaceEntries => "The query directory exceeds the 512-entry inspection limit.",
+        error.TooManyQueryFiles => "The query directory exceeds the 128-file limit.",
+        error.NoSpaceLeft, error.DiskQuota => "The SQL file could not be saved because the filesystem has no available space.",
+        error.AccessDenied, error.PermissionDenied, error.ReadOnlyFileSystem => "The configured query directory is not writable by dbui.",
+        else => "The SQL file operation could not be completed.",
+    };
+}
+
+fn redirectQuery(
+    request_context: *web_app.RequestContext,
+    database_id: []const u8,
+    file_name: ?[]const u8,
+    fields: http_params.Parameters,
+    notice: []const u8,
+) !void {
+    var location: std.Io.Writer.Allocating = .init(request_context.arena);
+    try location.writer.print("/db/{s}/query?", .{database_id});
+    var has_parameter = false;
+    if (file_name) |name| {
+        try location.writer.writeAll("file=");
+        try writeUrlComponent(&location.writer, name);
+        has_parameter = true;
+    }
+    if (fields.get("q")) |search| {
+        if (search.len != 0) {
+            if (has_parameter) try location.writer.writeByte('&');
+            try location.writer.writeAll("q=");
+            try writeUrlComponent(&location.writer, search);
+            has_parameter = true;
+        }
+    }
+    if (std.mem.eql(u8, fields.get("internal") orelse "", "1")) {
+        if (has_parameter) try location.writer.writeByte('&');
+        try location.writer.writeAll("internal=1");
+        has_parameter = true;
+    }
+    if (has_parameter) try location.writer.writeByte('&');
+    try location.writer.print("{s}=1", .{notice});
+    try response.redirect(request_context.request, location.written(), .see_other, &security_headers);
+}
+
 fn encodeUrlComponent(allocator: std.mem.Allocator, value: []const u8) ![]u8 {
     var output: std.Io.Writer.Allocating = .init(allocator);
+    try writeUrlComponent(&output.writer, value);
+    return output.toOwnedSlice();
+}
+
+fn writeUrlComponent(writer: *std.Io.Writer, value: []const u8) !void {
     const digits = "0123456789ABCDEF";
     for (value) |byte| {
         if (std.ascii.isAlphanumeric(byte) or byte == '-' or byte == '_' or byte == '.' or byte == '~') {
-            try output.writer.writeByte(byte);
+            try writer.writeByte(byte);
         } else {
-            try output.writer.writeByte('%');
-            try output.writer.writeByte(digits[byte >> 4]);
-            try output.writer.writeByte(digits[byte & 0x0f]);
+            try writer.writeByte('%');
+            try writer.writeByte(digits[byte >> 4]);
+            try writer.writeByte(digits[byte & 0x0f]);
         }
     }
-    return output.toOwnedSlice();
 }
 
 fn loadSidebar(
@@ -872,12 +1414,81 @@ fn queryErrorStatus(err: anyerror) std.http.Status {
     };
 }
 
+fn parseFormOffset(value: []const u8) !usize {
+    if (value.len == 0) return error.InvalidSourceOffset;
+    return std.fmt.parseInt(usize, value, 10) catch error.InvalidSourceOffset;
+}
+
+fn formRevision(value: []const u8) ?query_files.Revision {
+    if (value.len != 64) return null;
+    for (value) |byte| if (!std.ascii.isHex(byte)) return null;
+    var revision: query_files.Revision = undefined;
+    @memcpy(&revision, value[0..64]);
+    return revision;
+}
+
+fn renderQueryExecutionFailure(
+    context: *Context,
+    request_context: *web_app.RequestContext,
+    configured: *const config.DatabaseConfig,
+    database: *sqlite.Database,
+    sidebar: views.Sidebar,
+    document: ?query_files.Document,
+    source: []const u8,
+    saved_before_run: bool,
+    err: anyerror,
+    scope: query_mod.Scope,
+    selection_start: usize,
+    selection_end: usize,
+    cursor: usize,
+    request_id: u64,
+    fragment_requested: bool,
+) !Outcome {
+    const status = queryErrorStatus(err);
+    std.log.warn(
+        "event=sqlite_query_error database={s} primary={d} extended={d} error={s}",
+        .{ configured.id, database.primaryCode(), database.extendedCode(), @errorName(err) },
+    );
+    const message = try queryErrorMessage(request_context.arena, database, err);
+    if (fragment_requested) {
+        const fragment = try views.queryFragment(request_context.arena, .{
+            .error_message = message,
+            .saved_before_run = saved_before_run,
+        });
+        try respondQueryFragment(request_context, fragment, status, document);
+        return .{ .status = status, .database_id = configured.id, .route_name = "query" };
+    }
+    const body = try views.queryPage(request_context.arena, .{
+        .registry = context.registry,
+        .database = configured,
+        .sidebar = sidebar,
+        .csrf_token = &context.csrf_token,
+        .sql = source,
+        .document = document,
+        .error_message = message,
+        .notice = if (saved_before_run) "SQL file saved before execution." else null,
+        .saved_before_run = saved_before_run,
+        .scope = scope,
+        .selection_start_byte = selection_start,
+        .selection_end_byte = selection_end,
+        .cursor_byte = cursor,
+    });
+    try respondHtml(request_context.request, body, status);
+    _ = request_id;
+    return .{ .status = status, .database_id = configured.id, .route_name = "query" };
+}
+
 fn queryErrorMessage(allocator: std.mem.Allocator, database: *sqlite.Database, err: anyerror) ![]const u8 {
     const fixed: ?[]const u8 = switch (err) {
         error.EmptySql => "Enter one SQLite statement.",
         error.SqlTooLong => "SQL source is limited to 64 KiB.",
         error.InvalidSqlEncoding => "SQL source must be valid UTF-8.",
         error.MultipleStatements => "Enter exactly one executable SQLite statement.",
+        error.InvalidExecutionScope => "Choose whole-editor, selection, or current-statement execution.",
+        error.InvalidSourceOffset => "The editor selection no longer matches the submitted UTF-8 source.",
+        error.EmptySelection => "Select executable SQL or place the caret inside a statement.",
+        error.NoStatementAtCursor => "No SQLite statement exists at the current caret position.",
+        error.TooManyStatementBoundaries => "This SQL source has too many semicolon boundaries for caret execution. Select one statement explicitly and run the selection.",
         error.StatementProhibited => "ATTACH, DETACH, transaction control, and savepoint control are prohibited.",
         error.DatabaseReadOnly => "This database is configured as read-only.",
         error.QueryInterrupted => "Query interrupted after 10 seconds.",
@@ -931,11 +1542,46 @@ fn respondHtml(http_request: *std.http.Server.Request, body: []const u8, status:
     });
 }
 
+fn respondQueryFragment(
+    request_context: *web_app.RequestContext,
+    body: []const u8,
+    status: std.http.Status,
+    document: ?query_files.Document,
+) !void {
+    var headers = response.Headers{};
+    try headers.append(&security_headers);
+    if (document) |value| {
+        if (value.revision) |revision| {
+            const etag = try std.fmt.allocPrint(request_context.arena, "\"{s}\"", .{&revision});
+            try headers.add("etag", etag);
+        }
+    }
+    try response.respond(request_context.request, body, .{
+        .status = status,
+        .content_type = "text/html; charset=utf-8",
+        .cache_control = "no-store",
+        .extra_headers = headers.slice(),
+    });
+}
+
+fn respondSaveState(request_context: *web_app.RequestContext, revision: query_files.Revision) !void {
+    var headers = response.Headers{};
+    try headers.append(&security_headers);
+    const etag = try std.fmt.allocPrint(request_context.arena, "\"{s}\"", .{&revision});
+    try headers.add("etag", etag);
+    try response.respond(request_context.request, "saved\n", .{
+        .status = .ok,
+        .content_type = "text/plain; charset=utf-8",
+        .cache_control = "no-store",
+        .extra_headers = headers.slice(),
+    });
+}
+
 const security_headers = [_]std.http.Header{
     // `no-referrer` causes native same-origin POSTs in Chromium to carry
-    // `Origin: null`, defeating the host-match defense. `same-origin` keeps
-    // cross-site referrers suppressed while preserving a verifiable Origin.
-    .{ .name = "referrer-policy", .value = "same-origin" },
+    // `Origin: null`, defeating the host-match defense. `origin` keeps paths
+    // and query filenames out of referrers while preserving a verifiable Origin.
+    .{ .name = "referrer-policy", .value = "origin" },
     .{ .name = "x-content-type-options", .value = "nosniff" },
     .{ .name = "x-frame-options", .value = "DENY" },
     .{ .name = "content-security-policy", .value = "default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:" },

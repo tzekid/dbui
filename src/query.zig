@@ -7,6 +7,28 @@ pub const maximum_rows = 500;
 pub const maximum_columns = 256;
 pub const maximum_materialized_bytes = 4 * 1024 * 1024;
 pub const deadline_seconds = 10;
+pub const maximum_statement_boundaries = 1024;
+
+pub const Scope = enum {
+    whole,
+    selection,
+    current,
+
+    pub fn parse(value: []const u8) !Scope {
+        if (std.mem.eql(u8, value, "whole")) return .whole;
+        if (std.mem.eql(u8, value, "selection")) return .selection;
+        if (std.mem.eql(u8, value, "current")) return .current;
+        return error.InvalidExecutionScope;
+    }
+};
+
+pub const ResolvedSource = struct {
+    sql: []const u8,
+    start_byte: usize,
+    end_byte: usize,
+    line_start: usize,
+    line_end: usize,
+};
 
 pub const Truncation = enum { row_limit, byte_limit };
 
@@ -26,6 +48,99 @@ pub const Action = union(enum) {
     result: Result,
 };
 
+pub fn resolveSource(
+    allocator: std.mem.Allocator,
+    database: *sqlite.Database,
+    source: []const u8,
+    scope: Scope,
+    selection_start: usize,
+    selection_end: usize,
+    cursor: usize,
+) !ResolvedSource {
+    if (source.len > maximum_sql_bytes) return error.SqlTooLong;
+    if (!std.unicode.utf8ValidateSlice(source) or std.mem.indexOfScalar(u8, source, 0) != null) return error.InvalidSqlEncoding;
+    const range = switch (scope) {
+        .whole => ByteRange{ .start = 0, .end = source.len },
+        .selection => block: {
+            try validateOffset(source, selection_start);
+            try validateOffset(source, selection_end);
+            if (selection_start >= selection_end) return error.EmptySelection;
+            break :block ByteRange{ .start = selection_start, .end = selection_end };
+        },
+        .current => block: {
+            try validateOffset(source, cursor);
+            break :block try currentStatement(allocator, database, source, cursor);
+        },
+    };
+    const line_start = 1 + std.mem.count(u8, source[0..range.start], "\n");
+    var line_end = line_start + std.mem.count(u8, source[range.start..range.end], "\n");
+    if (range.end > range.start and source[range.end - 1] == '\n' and line_end > line_start) line_end -= 1;
+    return .{
+        .sql = source[range.start..range.end],
+        .start_byte = range.start,
+        .end_byte = range.end,
+        .line_start = line_start,
+        .line_end = line_end,
+    };
+}
+
+const ByteRange = struct { start: usize, end: usize };
+
+fn currentStatement(
+    allocator: std.mem.Allocator,
+    database: *sqlite.Database,
+    source: []const u8,
+    cursor: usize,
+) !ByteRange {
+    if (std.mem.count(u8, source, ";") > maximum_statement_boundaries) return error.TooManyStatementBoundaries;
+    const source_z = try allocator.dupeSentinel(u8, source, 0);
+    var ranges: [maximum_statement_boundaries + 1]ByteRange = undefined;
+    var range_count: usize = 0;
+    var start: usize = 0;
+    for (source, 0..) |byte, index| {
+        if (byte != ';') continue;
+        const after = index + 1;
+        const saved = source_z[after];
+        source_z[after] = 0;
+        const complete = sqlite.raw.sqlite3_complete(source_z.ptr + start);
+        source_z[after] = saved;
+        if (complete == 0) continue;
+        ranges[range_count] = .{ .start = start, .end = index + 1 };
+        range_count += 1;
+        start = index + 1;
+    }
+
+    if (start < source.len) {
+        var tail_has_statement = true;
+        const prepared = database.prepareWithTail(source[start..]) catch null;
+        if (prepared) |value| {
+            var mutable = value;
+            if (mutable.statement) |*statement| {
+                statement.deinit();
+            } else {
+                tail_has_statement = false;
+            }
+        }
+        if (tail_has_statement) {
+            ranges[range_count] = .{ .start = start, .end = source.len };
+            range_count += 1;
+        } else if (range_count != 0) {
+            ranges[range_count - 1].end = source.len;
+        }
+    }
+    if (range_count == 0) return error.EmptySql;
+    for (ranges[0..range_count]) |range| {
+        if (cursor >= range.start and cursor < range.end) return range;
+    }
+    if (cursor == source.len) return ranges[range_count - 1];
+    return error.NoStatementAtCursor;
+}
+
+fn validateOffset(source: []const u8, offset: usize) !void {
+    if (offset > source.len) return error.InvalidSourceOffset;
+    if (offset < source.len and source[offset] & 0xc0 == 0x80) return error.InvalidSourceOffset;
+}
+
 pub fn execute(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -35,7 +150,7 @@ pub fn execute(
 ) !Action {
     if (sql.len == 0 or std.mem.trim(u8, sql, " \t\r\n").len == 0) return error.EmptySql;
     if (sql.len > maximum_sql_bytes) return error.SqlTooLong;
-    if (!std.unicode.utf8ValidateSlice(sql)) return error.InvalidSqlEncoding;
+    if (!std.unicode.utf8ValidateSlice(sql) or std.mem.indexOfScalar(u8, sql, 0) != null) return error.InvalidSqlEncoding;
 
     try database.installQueryAuthorizer();
     var deadline = sqlite.Deadline.afterSeconds(io, deadline_seconds);

@@ -1,11 +1,13 @@
 const std = @import("std");
 const sqlite = @import("sqlite.zig");
+const query_files = @import("query_files.zig");
 
 pub const DatabaseConfig = struct {
     id: []const u8,
     label: []const u8,
     path: []const u8,
     mode: sqlite.AccessMode,
+    queries_path: ?[]const u8 = null,
 
     pub fn basename(self: DatabaseConfig) []const u8 {
         return std.fs.path.basename(self.path);
@@ -78,6 +80,7 @@ const RawDatabase = struct {
     label: []const u8,
     path: []const u8,
     mode: []const u8,
+    queries_path: ?[]const u8 = null,
 };
 
 fn parseListen(value: []const u8) !Listen {
@@ -127,11 +130,27 @@ fn validateDatabase(
     defer schema_check.deinit();
     _ = try schema_check.step();
 
+    const queries_path: ?[]const u8 = if (candidate.queries_path) |workspace| block: {
+        if (!std.fs.path.isAbsolute(workspace)) return error.QueryPathMustBeAbsolute;
+        const workspace_z = try std.Io.Dir.realPathFileAbsoluteAlloc(io, workspace, allocator);
+        const canonical_workspace: []const u8 = workspace_z;
+        const workspace_stat = try std.Io.Dir.cwd().statFile(io, canonical_workspace, .{ .follow_symlinks = true });
+        if (workspace_stat.kind != .directory) return error.QueryPathNotDirectory;
+        for (previous) |configured| {
+            if (configured.queries_path) |existing| {
+                if (std.mem.eql(u8, existing, canonical_workspace)) return error.DuplicateQueryPath;
+            }
+        }
+        try query_files.validateWorkspace(io, canonical_workspace);
+        break :block canonical_workspace;
+    } else null;
+
     return .{
         .id = candidate.id,
         .label = candidate.label,
         .path = canonical,
         .mode = mode,
+        .queries_path = queries_path,
     };
 }
 

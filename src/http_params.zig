@@ -18,25 +18,29 @@ pub const Parameters = struct {
 
 pub fn parseQuery(allocator: std.mem.Allocator, target: request.Target) !Parameters {
     var iterator = request.queryIterator(target, 64);
-    return parse(allocator, &iterator);
+    return parse(allocator, &iterator, 64 * 1024);
 }
 
 pub fn parseForm(allocator: std.mem.Allocator, encoded: []const u8) !Parameters {
-    var iterator = request.formIterator(encoded, 64);
-    return parse(allocator, &iterator);
+    return parseFormLimited(allocator, encoded, 64 * 1024);
 }
 
-fn parse(allocator: std.mem.Allocator, iterator: *request.ParameterIterator) !Parameters {
+pub fn parseFormLimited(allocator: std.mem.Allocator, encoded: []const u8, decoded_limit: usize) !Parameters {
+    var iterator = request.formIterator(encoded, 64);
+    return parse(allocator, &iterator, decoded_limit);
+}
+
+fn parse(allocator: std.mem.Allocator, iterator: *request.ParameterIterator, decoded_limit: usize) !Parameters {
     var items: std.ArrayList(request.Parameter) = .empty;
     var decoded_total: usize = 0;
     while (try iterator.next()) |encoded| {
-        decoded_total = std.math.add(usize, decoded_total, encoded.name.len + encoded.value.len) catch
-            return error.ParametersTooLarge;
-        if (decoded_total > 64 * 1024) return error.ParametersTooLarge;
         const name_storage = try allocator.alloc(u8, encoded.name.len);
         const value_storage = try allocator.alloc(u8, encoded.value.len);
         const name = try request.decodeComponent(name_storage, encoded.name, true);
         const value = try request.decodeComponent(value_storage, encoded.value, true);
+        decoded_total = std.math.add(usize, decoded_total, name.len + value.len) catch
+            return error.ParametersTooLarge;
+        if (decoded_total > decoded_limit) return error.ParametersTooLarge;
         for (items.items) |existing| {
             if (std.mem.eql(u8, existing.name, name)) return error.DuplicateParameter;
         }

@@ -25,13 +25,17 @@ ro_db="$runtime_dir/fixture-ro.db"
 sqlite3 "$rw_db" ".read $repo_root/testdata/fixture.sql"
 cp "$rw_db" "$ro_db"
 chmod 0444 "$ro_db"
+queries_dir="$runtime_dir/queries"
+mkdir "$queries_dir"
+printf 'SELECT 1;\r\n' >"$queries_dir/crlf.sql"
+ln -s "$rw_db" "$queries_dir/hidden-link.sql"
 
 config="$runtime_dir/config.json"
 cat >"$config" <<JSON
 {
   "listen": "127.0.0.1:17432",
   "databases": [
-    {"id":"fixture","label":"Fixture","path":"$rw_db","mode":"read-write"},
+    {"id":"fixture","label":"Fixture","path":"$rw_db","mode":"read-write","queries_path":"$queries_dir"},
     {"id":"fixture_ro","label":"Fixture read-only","path":"$ro_db","mode":"read-only"}
   ]
 }
@@ -46,6 +50,16 @@ if "$binary" --config "$missing" --check >/dev/null 2>&1; then
   exit 1
 fi
 [[ ! -e "$runtime_dir/must-not-exist.db" ]]
+missing_queries="$runtime_dir/missing-queries.json"
+missing_queries_dir="$runtime_dir/must-not-exist-queries"
+cat >"$missing_queries" <<JSON
+{"listen":"127.0.0.1:17432","databases":[{"id":"missing_queries","label":"Missing queries","path":"$rw_db","mode":"read-write","queries_path":"$missing_queries_dir"}]}
+JSON
+if "$binary" --config "$missing_queries" --check >/dev/null 2>&1; then
+  echo "missing query directory unexpectedly passed validation" >&2
+  exit 1
+fi
+[[ ! -e "$missing_queries_dir" ]]
 "$binary" --config "$config" --check >/dev/null
 
 "$binary" --config "$config" >"$runtime_dir/server.log" 2>&1 &
@@ -92,6 +106,97 @@ grep -Fq '.sidebar-disclosure:not([open]) > summary { display: list-item;' "$run
 curl --silent --fail http://127.0.0.1:17432/db/fixture/query -o "$runtime_dir/query.html"
 csrf=$(sed -n 's/.*name="csrf_token" value="\([^"]*\)".*/\1/p' "$runtime_dir/query.html")
 [[ ${#csrf} -eq 64 ]]
+grep -q 'Search files and objects' "$runtime_dir/query.html"
+grep -q 'crlf.sql' "$runtime_dir/query.html"
+if grep -q 'hidden-link.sql' "$runtime_dir/query.html"; then
+    echo 'query sidebar exposed a symlink' >&2
+    exit 1
+fi
+
+status=$(curl --silent --data-urlencode "csrf_token=$csrf" --data-urlencode 'new_name=daily-health.sql' --data-urlencode 'sql=SELECT 2;' http://127.0.0.1:17432/db/fixture/query/file/create -o "$runtime_dir/create.html" -D "$runtime_dir/create.headers" -w '%{http_code}')
+[[ $status == 303 ]]
+[[ $(cat "$queries_dir/daily-health.sql") == 'SELECT 2;' ]]
+grep -qi '^location: /db/fixture/query?file=daily-health.sql.*created=1' "$runtime_dir/create.headers"
+
+curl --silent --fail 'http://127.0.0.1:17432/db/fixture/query?file=daily-health.sql' -o "$runtime_dir/file.html"
+base_revision=$(sed -n 's/.*name="base_revision" value="\([0-9a-f]*\)".*/\1/p' "$runtime_dir/file.html" | head -1)
+[[ ${#base_revision} -eq 64 ]]
+status=$(curl --silent --data-urlencode "csrf_token=$csrf" --data-urlencode 'file=daily-health.sql' --data-urlencode "base_revision=$base_revision" --data-urlencode 'sql=SELECT 3;' http://127.0.0.1:17432/db/fixture/query/file/save -o "$runtime_dir/save.html" -w '%{http_code}')
+[[ $status == 303 ]]
+[[ $(cat "$queries_dir/daily-health.sql") == 'SELECT 3;' ]]
+
+curl --silent --fail 'http://127.0.0.1:17432/db/fixture/query?file=crlf.sql' -o "$runtime_dir/crlf.html"
+crlf_revision=$(sed -n 's/.*name="base_revision" value="\([0-9a-f]*\)".*/\1/p' "$runtime_dir/crlf.html" | head -1)
+status=$(curl --silent --data-urlencode "csrf_token=$csrf" --data-urlencode 'file=crlf.sql' --data-urlencode "base_revision=$crlf_revision" --data-urlencode $'sql=SELECT 4;\n' --data-urlencode 'fragment=save-state' http://127.0.0.1:17432/db/fixture/query/file/save -o "$runtime_dir/crlf-save.html" -D "$runtime_dir/crlf-save.headers" -w '%{http_code}')
+[[ $status == 200 ]]
+grep -qi '^etag: "[0-9a-f]\{64\}"' "$runtime_dir/crlf-save.headers"
+od -An -tx1 "$queries_dir/crlf.sql" | grep -q '0d 0a'
+
+curl --silent --fail 'http://127.0.0.1:17432/db/fixture/query?file=daily-health.sql' -o "$runtime_dir/pre-conflict.html"
+stale_revision=$(sed -n 's/.*name="base_revision" value="\([0-9a-f]*\)".*/\1/p' "$runtime_dir/pre-conflict.html" | head -1)
+printf 'SELECT 99;\n' >"$queries_dir/daily-health.sql"
+status=$(curl --silent --data-urlencode "csrf_token=$csrf" --data-urlencode 'file=daily-health.sql' --data-urlencode "base_revision=$stale_revision" --data-urlencode 'sql=SELECT 5;' http://127.0.0.1:17432/db/fixture/query/file/save -o "$runtime_dir/conflict.html" -w '%{http_code}')
+[[ $status == 409 ]]
+grep -q 'Your edits were not saved' "$runtime_dir/conflict.html"
+grep -q 'SELECT 5;' "$runtime_dir/conflict.html"
+[[ $(cat "$queries_dir/daily-health.sql") == 'SELECT 99;' ]]
+
+status=$(curl --silent --data-urlencode "csrf_token=$csrf" --data-urlencode 'file=daily-health.sql' --data-urlencode "base_revision=$stale_revision" --data-urlencode 'new_name=crlf.sql' --data-urlencode 'sql=SELECT 5;' http://127.0.0.1:17432/db/fixture/query/file/create -o "$runtime_dir/conflict-copy.html" -w '%{http_code}')
+[[ $status == 409 ]]
+grep -q '>Conflict<' "$runtime_dir/conflict-copy.html"
+grep -q 'SELECT 5;' "$runtime_dir/conflict-copy.html"
+grep -q 'name="new_name"[^>]*value="crlf.sql"' "$runtime_dir/conflict-copy.html"
+[[ $(cat "$queries_dir/daily-health.sql") == 'SELECT 99;' ]]
+od -An -tx1 "$queries_dir/crlf.sql" | grep -q '0d 0a'
+
+curl --silent --fail 'http://127.0.0.1:17432/db/fixture/query?file=daily-health.sql' -o "$runtime_dir/pre-rename.html"
+current_revision=$(sed -n 's/.*name="base_revision" value="\([0-9a-f]*\)".*/\1/p' "$runtime_dir/pre-rename.html" | head -1)
+status=$(curl --silent --data-urlencode "csrf_token=$csrf" --data-urlencode 'file=daily-health.sql' --data-urlencode 'new_name=renamed.sql' --data-urlencode "base_revision=$current_revision" http://127.0.0.1:17432/db/fixture/query/file/rename -o "$runtime_dir/rename.html" -w '%{http_code}')
+[[ $status == 303 ]]
+[[ ! -e "$queries_dir/daily-health.sql" && -f "$queries_dir/renamed.sql" ]]
+
+curl --silent --fail 'http://127.0.0.1:17432/db/fixture/query?file=renamed.sql' -o "$runtime_dir/pre-run.html"
+run_revision=$(sed -n 's/.*name="base_revision" value="\([0-9a-f]*\)".*/\1/p' "$runtime_dir/pre-run.html" | head -1)
+status=$(curl --silent --data-urlencode "csrf_token=$csrf" --data-urlencode 'file=renamed.sql' --data-urlencode "base_revision=$run_revision" --data-urlencode "sql=SELECT 'file_result';" http://127.0.0.1:17432/db/fixture/query -o "$runtime_dir/file-run.html" -w '%{http_code}')
+[[ $status == 200 ]]
+grep -q 'file_result' "$runtime_dir/file-run.html"
+[[ $(cat "$queries_dir/renamed.sql") == "SELECT 'file_result';" ]]
+delete_revision=$(sed -n 's/.*name="base_revision" value="\([0-9a-f]*\)".*/\1/p' "$runtime_dir/file-run.html" | head -1)
+status=$(curl --silent --data-urlencode "csrf_token=$csrf" --data-urlencode 'file=renamed.sql' --data-urlencode "base_revision=$delete_revision" --data-urlencode 'confirm_delete=1' http://127.0.0.1:17432/db/fixture/query/file/delete -o "$runtime_dir/delete.html" -w '%{http_code}')
+[[ $status == 303 ]]
+[[ ! -e "$queries_dir/renamed.sql" ]]
+
+multi_sql=$'SELECT 11 AS first;\nSELECT 22 AS second;'
+selection_start=$(printf '%s' $'SELECT 11 AS first;\n' | wc -c)
+selection_end=$(printf '%s' "$multi_sql" | wc -c)
+status=$(curl --silent --data-urlencode "csrf_token=$csrf" --data-urlencode "sql=$multi_sql" --data-urlencode 'scope=selection' --data-urlencode "selection_start_byte=$selection_start" --data-urlencode "selection_end_byte=$selection_end" --data-urlencode 'cursor_byte=0' --data-urlencode 'fragment=query-result' http://127.0.0.1:17432/db/fixture/query -o "$runtime_dir/selection.html" -w '%{http_code}')
+[[ $status == 200 ]]
+grep -q 'second' "$runtime_dir/selection.html"
+if grep -q 'first' "$runtime_dir/selection.html"; then
+    echo 'selection execution returned the unselected statement' >&2
+    exit 1
+fi
+
+trigger_source=$'CREATE TRIGGER current_scope_guard AFTER UPDATE ON users BEGIN SELECT 1; SELECT 2; END;\nSELECT 33 AS after_trigger;'
+cursor_byte=$(printf '%s' $'CREATE TRIGGER current_scope_guard AFTER UPDATE ON users BEGIN SELECT 1; SELECT 2; END;\nSELECT ' | wc -c)
+status=$(curl --silent --data-urlencode "csrf_token=$csrf" --data-urlencode "sql=$trigger_source" --data-urlencode 'scope=current' --data-urlencode 'selection_start_byte=0' --data-urlencode 'selection_end_byte=0' --data-urlencode "cursor_byte=$cursor_byte" --data-urlencode 'fragment=query-result' http://127.0.0.1:17432/db/fixture/query -o "$runtime_dir/current.html" -w '%{http_code}')
+[[ $status == 200 ]]
+grep -q 'after_trigger' "$runtime_dir/current.html"
+[[ $(sqlite3 "$rw_db" "SELECT count(*) FROM sqlite_schema WHERE name='current_scope_guard'") == 0 ]]
+
+status=$(curl --silent --data-urlencode "csrf_token=$csrf" --data-urlencode "sql=$multi_sql" --data-urlencode 'scope=selection' --data-urlencode 'selection_start_byte=0' --data-urlencode "selection_end_byte=$selection_end" --data-urlencode 'cursor_byte=0' --data-urlencode 'fragment=query-result' http://127.0.0.1:17432/db/fixture/query -o "$runtime_dir/multiple-selection.html" -w '%{http_code}')
+[[ $status == 422 ]]
+grep -q 'exactly one executable' "$runtime_dir/multiple-selection.html"
+
+semicolon_heavy_sql="SELECT '$(head -c 1025 /dev/zero | tr '\0' ';')';"
+status=$(curl --silent --data-urlencode "csrf_token=$csrf" --data-urlencode "sql=$semicolon_heavy_sql" --data-urlencode 'scope=current' --data-urlencode 'selection_start_byte=0' --data-urlencode 'selection_end_byte=0' --data-urlencode 'cursor_byte=0' --data-urlencode 'fragment=query-result' http://127.0.0.1:17432/db/fixture/query -o "$runtime_dir/semicolon-boundary.html" -w '%{http_code}')
+[[ $status == 422 ]]
+grep -q 'Select one statement explicitly' "$runtime_dir/semicolon-boundary.html"
+
+encoded_boundary_sql=$(head -c 65536 /dev/zero | tr '\0' '%')
+status=$(curl --silent --data-urlencode "csrf_token=$csrf" --data-urlencode "sql=$encoded_boundary_sql" http://127.0.0.1:17432/db/fixture/query -o "$runtime_dir/encoded-boundary.html" -w '%{http_code}')
+[[ $status == 422 ]]
+grep -q 'Action failed' "$runtime_dir/encoded-boundary.html"
 
 status=$(curl --silent --data-urlencode "csrf_token=$csrf" --data-urlencode "sql=SELECT 'e2e_secret_sql_literal'" http://127.0.0.1:17432/db/fixture/query -o "$runtime_dir/select.html" -w '%{http_code}')
 [[ $status == 200 ]]

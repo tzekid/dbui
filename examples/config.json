@@ -5,7 +5,8 @@
       "id": "example",
       "label": "Example",
       "path": "/srv/example/data/example.db",
-      "mode": "read-only"
+      "mode": "read-only",
+      "queries_path": "/srv/dbui/queries/example"
     }
   ]
 }

@@ -46,11 +46,29 @@ dbui --version
 See [`examples/config.json`](examples/config.json). Only these fields are accepted:
 
 - Top level: `listen`, `databases`
-- Database: `id`, `label`, `path`, `mode`
+- Database: `id`, `label`, `path`, `mode`, optional `queries_path`
 
 Database IDs match `[a-z0-9][a-z0-9_-]{0,63}`. Paths must be absolute, existing regular files. They are canonicalized at startup; duplicate IDs and canonical paths are rejected. Every mode is explicit: `read-only` or `read-write`. Missing files are never created, and any invalid database prevents the server from starting.
 
 The listener is restricted to `127.0.0.1` or `::1`. Keep it behind an authenticated reverse proxy.
+
+`queries_path` enables the file-backed Query workspace for that database. It must be an absolute, existing, dedicated directory that the service can read and write. dbui canonicalizes it, rejects duplicate query directories, and performs an exclusive create/delete probe during `--check`; it never creates a missing query directory. Without `queries_path`, Query remains a disposable Scratch console.
+
+## SQL file workspace
+
+The Query page can keep ordinary `.sql` files beside the database-object navigation. These are real server files, not records in a dbui control database:
+
+- Files are direct children of the configured query directory; no recursive file browser is exposed.
+- Scratch is unsaved until `Save as file` is used.
+- A visible Save action and `Ctrl/Cmd+S` persist the current file.
+- `Ctrl/Cmd+Enter` runs the browser selection when present, otherwise the SQLite statement at the caret.
+- Results update below the editor without replacing its selection, focus, scroll, or undo state.
+- JavaScript disabled: file lifecycle still works through ordinary forms, and Query executes the whole textarea when it contains exactly one statement.
+- A file may contain many statements, but one Run executes exactly one statement. Multi-statement selection and Run All are deliberately deferred.
+
+Files are limited to 64 KiB and valid UTF-8. Consistent LF and CRLF are preserved. Mixed or bare-CR line endings, NUL-containing files, invalid UTF-8, oversized files, symlinks, and non-regular files are never silently normalized or followed.
+
+Every file page carries a SHA-256 revision. Save, Run, Rename, and Delete reject stale revisions; a conflict preserves the submitted browser buffer and never silently overwrites the disk file. Saves use same-directory atomic replacement and preserve the existing file permissions. Query files may remain editable even when the database itself is configured read-only; saving SQL never grants permission to execute a database write.
 
 ## Read-only and read/write behavior
 
@@ -78,9 +96,11 @@ The initial hard limits are:
 | Boundary | Limit |
 | --- | ---: |
 | Request target | 16 KiB |
-| POST body | 128 KiB |
-| Decoded parameters | 64 parameters / 64 KiB |
+| Ordinary POST body | 128 KiB |
+| Query/source POST body | 256 KiB encoded |
+| Decoded parameters | 64 parameters / 64 KiB ordinary, 80 KiB source forms |
 | SQL source | 64 KiB |
+| Query directory | 512 entries inspected / 128 SQL files |
 | Browse page | 25, 50, 100, or 250 rows |
 | Query result | 500 rows / 256 columns |
 | Grid text preview | 512 bytes |
@@ -120,14 +140,18 @@ systemctl --user status dbui.service
 
 Read-only database files should also be read-only at the OS boundary. Read/write entries need write/search permission on their parent directories and access to `-wal` and `-shm` sidecars. Do not grant broad project or `/srv` write access.
 
+Each configured query directory needs its own narrow `ReadWritePaths` entry when systemd filesystem protection is enabled. Prefer a service-owned directory with mode `0700`; new files are created with mode `0600`. Back up or version-control these files separately if they are operationally important.
+
 Do not naively copy an active database as a backup without accounting for its rollback journal or WAL state. Use an application-aware or SQLite backup procedure and rehearse recovery.
 
 ## Known limitations and deliberately deferred work
 
 - SQLite only
 - One trusted administrator with external authentication
-- One SQL statement at a time
-- No query history, saved queries, or autocomplete
+- One SQL statement per Run; no Run All or multiple result tabs
+- File-backed saved SQL is optional; there is no automatic query history, folder tree, or autocomplete
+- No passive current-statement highlighting in the native textarea
+- External SQL-file edits are detected on the next action or reload, not pushed live
 - No structured insert form
 - No BLOB editing or download
 - No rowid-based editing
