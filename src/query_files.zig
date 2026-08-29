@@ -6,6 +6,8 @@ pub const maximum_files = 128;
 pub const maximum_directory_entries = 512;
 pub const maximum_filename_bytes = 80;
 
+const scratch_file_name = ".dbui-scratch.sql";
+
 pub const Revision = [64]u8;
 
 pub const NewlineStyle = enum {
@@ -15,11 +17,34 @@ pub const NewlineStyle = enum {
 
 pub const Item = struct {
     name: []const u8,
+    modified_ns: i96,
 };
 
 pub const Listing = struct {
     items: []const Item,
     incompatible_entries: usize,
+    scratch_modified_ns: ?i96,
+
+    pub fn latest(self: Listing) ?Latest {
+        var result: ?Latest = null;
+        var modified_ns: i96 = 0;
+        if (self.scratch_modified_ns) |value| {
+            result = .scratch;
+            modified_ns = value;
+        }
+        for (self.items) |item| {
+            if (result == null or item.modified_ns > modified_ns) {
+                result = .{ .file = item.name };
+                modified_ns = item.modified_ns;
+            }
+        }
+        return result;
+    }
+};
+
+pub const Latest = union(enum) {
+    scratch,
+    file: []const u8,
 };
 
 pub const Issue = enum {
@@ -38,15 +63,18 @@ pub const Issue = enum {
     }
 };
 
+pub const DocumentKind = enum { scratch, file };
+
 pub const Document = struct {
-    name: []const u8,
+    kind: DocumentKind = .file,
+    name: []const u8 = "",
     source: []const u8 = "",
     revision: ?Revision = null,
     newline_style: NewlineStyle = .lf,
     issue: ?Issue = null,
 
     pub fn editable(self: Document) bool {
-        return self.issue == null and self.revision != null;
+        return self.issue == null and (self.kind == .scratch or self.revision != null);
     }
 };
 
@@ -106,10 +134,21 @@ pub fn list(
     var items: std.ArrayList(Item) = .empty;
     var incompatible_entries: usize = 0;
     var directory_entries: usize = 0;
+    var scratch_modified_ns: ?i96 = null;
     var iterator = directory.iterate();
     while (try iterator.next(io)) |entry| {
         directory_entries += 1;
         if (directory_entries > maximum_directory_entries) return error.TooManyWorkspaceEntries;
+        if (std.mem.eql(u8, entry.name, scratch_file_name)) {
+            if (entry.kind == .file) {
+                const file_stat = directory.statFile(io, entry.name, .{ .follow_symlinks = false }) catch |err| switch (err) {
+                    error.FileNotFound => continue,
+                    else => |actual| return actual,
+                };
+                if (file_stat.kind == .file) scratch_modified_ns = file_stat.mtime.nanoseconds;
+            }
+            continue;
+        }
         if (!std.mem.endsWith(u8, entry.name, ".sql")) continue;
         if (entry.kind != .file) {
             incompatible_entries += 1;
@@ -119,13 +158,25 @@ pub fn list(
             incompatible_entries += 1;
             continue;
         };
+        const file_stat = directory.statFile(io, entry.name, .{ .follow_symlinks = false }) catch |err| switch (err) {
+            error.FileNotFound => continue,
+            else => |actual| return actual,
+        };
+        if (file_stat.kind != .file) {
+            incompatible_entries += 1;
+            continue;
+        }
         if (items.items.len == maximum_files) return error.TooManyQueryFiles;
-        try items.append(allocator, .{ .name = try allocator.dupe(u8, entry.name) });
+        try items.append(allocator, .{
+            .name = try allocator.dupe(u8, entry.name),
+            .modified_ns = file_stat.mtime.nanoseconds,
+        });
     }
     std.mem.sort(Item, items.items, {}, lessThanItem);
     return .{
         .items = try items.toOwnedSlice(allocator),
         .incompatible_entries = incompatible_entries,
+        .scratch_modified_ns = scratch_modified_ns,
     };
 }
 
@@ -136,21 +187,44 @@ pub fn load(
     name: []const u8,
 ) !Document {
     try validateFilename(name);
+    return loadLeaf(allocator, io, workspace_path, name, .file);
+}
+
+pub fn loadScratch(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    workspace_path: []const u8,
+) !Document {
+    return loadLeaf(allocator, io, workspace_path, scratch_file_name, .scratch) catch |err| switch (err) {
+        error.FileNotFound => .{ .kind = .scratch },
+        else => |actual| return actual,
+    };
+}
+
+fn loadLeaf(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    workspace_path: []const u8,
+    name: []const u8,
+    kind: DocumentKind,
+) !Document {
     var directory = try openWorkspace(io, workspace_path);
     defer directory.close(io);
 
+    const display_name = if (kind == .scratch) "" else name;
     const raw = readRaw(allocator, io, directory, name) catch |err| switch (err) {
-        error.FileTooLarge => return .{ .name = try allocator.dupe(u8, name), .issue = .too_large },
+        error.FileTooLarge => return .{ .kind = kind, .name = try allocator.dupe(u8, display_name), .issue = .too_large },
         else => |actual| return actual,
     };
     const normalized = normalize(allocator, raw.bytes) catch |err| switch (err) {
-        error.InvalidUtf8 => return .{ .name = try allocator.dupe(u8, name), .revision = raw.revision, .issue = .invalid_utf8 },
-        error.ContainsNul => return .{ .name = try allocator.dupe(u8, name), .revision = raw.revision, .issue = .contains_nul },
-        error.UnsupportedLineEndings => return .{ .name = try allocator.dupe(u8, name), .revision = raw.revision, .issue = .unsupported_line_endings },
+        error.InvalidUtf8 => return .{ .kind = kind, .name = try allocator.dupe(u8, display_name), .revision = raw.revision, .issue = .invalid_utf8 },
+        error.ContainsNul => return .{ .kind = kind, .name = try allocator.dupe(u8, display_name), .revision = raw.revision, .issue = .contains_nul },
+        error.UnsupportedLineEndings => return .{ .kind = kind, .name = try allocator.dupe(u8, display_name), .revision = raw.revision, .issue = .unsupported_line_endings },
         else => |actual| return actual,
     };
     return .{
-        .name = try allocator.dupe(u8, name),
+        .kind = kind,
+        .name = try allocator.dupe(u8, display_name),
         .source = normalized.source,
         .revision = raw.revision,
         .newline_style = normalized.style,
@@ -165,6 +239,17 @@ pub fn create(
     source: []const u8,
 ) !Document {
     try validateFilename(name);
+    return createLeaf(allocator, io, workspace_path, name, source, .file);
+}
+
+fn createLeaf(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    workspace_path: []const u8,
+    name: []const u8,
+    source: []const u8,
+    kind: DocumentKind,
+) !Document {
     const canonical_source = try canonicalizeEditorSource(allocator, source);
     var directory = try openWorkspace(io, workspace_path);
     defer directory.close(io);
@@ -179,7 +264,8 @@ pub fn create(
     try syncDirectory(io, directory);
 
     return .{
-        .name = try allocator.dupe(u8, name),
+        .kind = kind,
+        .name = if (kind == .scratch) "" else try allocator.dupe(u8, name),
         .source = try allocator.dupe(u8, canonical_source),
         .revision = hash(canonical_source),
         .newline_style = .lf,
@@ -196,6 +282,32 @@ pub fn save(
 ) !SaveResult {
     try validateFilename(name);
     try validateRevision(base_revision);
+    return saveLeaf(allocator, io, workspace_path, name, base_revision, source);
+}
+
+pub fn saveScratch(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    workspace_path: []const u8,
+    base_revision: []const u8,
+    source: []const u8,
+) !SaveResult {
+    if (base_revision.len == 0) {
+        const document = try createLeaf(allocator, io, workspace_path, scratch_file_name, source, .scratch);
+        return .{ .revision = document.revision.?, .changed = true };
+    }
+    try validateRevision(base_revision);
+    return saveLeaf(allocator, io, workspace_path, scratch_file_name, base_revision, source);
+}
+
+fn saveLeaf(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    workspace_path: []const u8,
+    name: []const u8,
+    base_revision: []const u8,
+    source: []const u8,
+) !SaveResult {
     const canonical_source = try canonicalizeEditorSource(allocator, source);
     var directory = try openWorkspace(io, workspace_path);
     defer directory.close(io);

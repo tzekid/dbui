@@ -17,6 +17,7 @@ pub const Sidebar = struct {
     show_internal: bool = false,
     query_files: ?query_files.Listing = null,
     current_file: ?[]const u8 = null,
+    scratch_selected: bool = false,
 };
 
 pub const DatabaseSummary = struct {
@@ -319,7 +320,10 @@ pub fn queryPage(allocator: std.mem.Allocator, page: QueryPage) ![]u8 {
     errdefer output.deinit();
     const writer = &output.writer;
     const title = if (page.document) |document|
-        try std.fmt.allocPrint(allocator, "{s} · {s} · dbui", .{ document.name, page.database.label })
+        if (document.kind == .file)
+            try std.fmt.allocPrint(allocator, "{s} · {s} · dbui", .{ document.name, page.database.label })
+        else
+            try std.fmt.allocPrint(allocator, "Scratch · {s} · dbui", .{page.database.label})
     else
         try std.fmt.allocPrint(allocator, "Query · {s} · dbui", .{page.database.label});
     try shellStart(writer, title, page.registry, page.database, .query, page.sidebar);
@@ -353,10 +357,15 @@ pub fn queryPage(allocator: std.mem.Allocator, page: QueryPage) ![]u8 {
         try writer.writeAll(@tagName(page.scope));
         try writer.print("\" data-query-scope><input type=\"hidden\" name=\"selection_start_byte\" value=\"{d}\" data-selection-start><input type=\"hidden\" name=\"selection_end_byte\" value=\"{d}\" data-selection-end><input type=\"hidden\" name=\"cursor_byte\" value=\"{d}\" data-cursor-byte>", .{ page.selection_start_byte, page.selection_end_byte, page.cursor_byte });
         if (page.document) |document| {
-            try writer.writeAll("<input type=\"hidden\" name=\"file\" value=\"");
-            try html.attribute(writer, document.name);
-            try writer.writeAll("\"><input type=\"hidden\" name=\"base_revision\" value=\"");
-            try html.attribute(writer, &document.revision.?);
+            if (document.kind == .file) {
+                try writer.writeAll("<input type=\"hidden\" name=\"file\" value=\"");
+                try html.attribute(writer, document.name);
+                try writer.writeAll("\">");
+            } else {
+                try writer.writeAll("<input type=\"hidden\" name=\"scratch\" value=\"1\">");
+            }
+            try writer.writeAll("<input type=\"hidden\" name=\"base_revision\" value=\"");
+            if (document.revision) |revision| try html.attribute(writer, &revision);
             try writer.writeAll("\" data-base-revision>");
         }
         if (page.sidebar.show_internal) try writer.writeAll("<input type=\"hidden\" name=\"internal\" value=\"1\">");
@@ -411,34 +420,58 @@ pub fn queryFragment(allocator: std.mem.Allocator, fragment: QueryFragment) ![]u
 fn queryFileHeader(writer: *std.Io.Writer, page: QueryPage) !void {
     try writer.writeAll("<header class=\"query-file-header\"><div><p class=\"eyebrow\">");
     if (page.document) |document| {
-        try writer.writeAll("SQL file</p><h1>");
-        try html.text(writer, document.name);
-        try writer.writeAll("</h1></div><div class=\"query-file-controls\">");
-        if (document.editable()) {
-            if (page.file_conflict) {
-                try writer.writeAll("<span class=\"query-save-state query-save-state--conflict\" data-save-state data-initial-dirty aria-live=\"polite\">Conflict</span><a class=\"button\" href=\"/db/");
-                try html.attribute(writer, page.database.id);
-                try writer.writeAll("/query?file=");
-                try urlComponent(writer, document.name);
-                try writer.writeAll("\">Reload disk version</a><label class=\"save-as-label\"><span>New filename</span><input form=\"query-editor\" name=\"new_name\" type=\"text\" maxlength=\"80\" value=\"");
-                try html.attribute(writer, page.new_file_name);
-                try writer.writeAll("\" placeholder=\"conflict-copy.sql\"></label><button class=\"button\" type=\"submit\" form=\"query-editor\" formaction=\"/db/");
-                try html.attribute(writer, page.database.id);
-                try writer.writeAll("/query/file/create\">Save as new file</button>");
-            } else if (page.initial_unsaved) {
-                try writer.writeAll("<span class=\"query-save-state\" data-save-state data-initial-dirty aria-live=\"polite\">Unsaved changes</span><button class=\"button\" type=\"submit\" form=\"query-editor\" formaction=\"/db/");
-                try html.attribute(writer, page.database.id);
-                try writer.writeAll("/query/file/save\" data-save-button>Save</button>");
+        if (document.kind == .scratch) {
+            try writer.writeAll("SQL scratch</p><h1>Scratch</h1><p>Kept in this query workspace.</p></div><div class=\"query-file-controls\">");
+            if (document.editable()) {
+                if (page.file_conflict) {
+                    try writer.writeAll("<span class=\"query-save-state query-save-state--conflict\" data-save-state data-initial-dirty aria-live=\"polite\">Conflict</span><a class=\"button\" href=\"/db/");
+                    try html.attribute(writer, page.database.id);
+                    try writer.writeAll("/query?scratch=1\">Reload Scratch</a>");
+                } else {
+                    try writer.writeAll("<span class=\"query-save-state\" data-save-state");
+                    if (page.initial_unsaved) try writer.writeAll(" data-initial-dirty");
+                    try writer.writeAll(" aria-live=\"polite\">");
+                    if (page.initial_unsaved)
+                        try writer.writeAll("Unsaved changes")
+                    else if (document.revision != null)
+                        try writer.writeAll("Autosaved")
+                    else
+                        try writer.writeAll("Not saved yet");
+                    try writer.writeAll("</span><button class=\"button\" type=\"submit\" form=\"query-editor\" formaction=\"/db/");
+                    try html.attribute(writer, page.database.id);
+                    try writer.writeAll("/query/scratch/save\" data-save-button>Save scratch</button>");
+                }
+                try querySaveAsControls(writer, page, if (page.file_conflict) "conflict-copy.sql" else "daily-health.sql");
             } else {
-                try writer.writeAll("<span class=\"query-save-state\" data-save-state aria-live=\"polite\">Saved</span><button class=\"button\" type=\"submit\" form=\"query-editor\" formaction=\"/db/");
-                try html.attribute(writer, page.database.id);
-                try writer.writeAll("/query/file/save\" data-save-button>Save</button>");
+                try writer.writeAll("<span class=\"query-save-state\">Scratch unavailable</span>");
             }
         } else {
-            try writer.writeAll("<span class=\"query-save-state\">Read-only file</span>");
-        }
-        if (!page.file_conflict) {
-            if (document.revision) |revision| try queryFileActions(writer, page, document.name, &revision);
+            try writer.writeAll("SQL file</p><h1>");
+            try html.text(writer, document.name);
+            try writer.writeAll("</h1></div><div class=\"query-file-controls\">");
+            if (document.editable()) {
+                if (page.file_conflict) {
+                    try writer.writeAll("<span class=\"query-save-state query-save-state--conflict\" data-save-state data-initial-dirty aria-live=\"polite\">Conflict</span><a class=\"button\" href=\"/db/");
+                    try html.attribute(writer, page.database.id);
+                    try writer.writeAll("/query?file=");
+                    try urlComponent(writer, document.name);
+                    try writer.writeAll("\">Reload disk version</a>");
+                    try querySaveAsControls(writer, page, "conflict-copy.sql");
+                } else if (page.initial_unsaved) {
+                    try writer.writeAll("<span class=\"query-save-state\" data-save-state data-initial-dirty aria-live=\"polite\">Unsaved changes</span><button class=\"button\" type=\"submit\" form=\"query-editor\" formaction=\"/db/");
+                    try html.attribute(writer, page.database.id);
+                    try writer.writeAll("/query/file/save\" data-save-button>Save</button>");
+                } else {
+                    try writer.writeAll("<span class=\"query-save-state\" data-save-state aria-live=\"polite\">Saved</span><button class=\"button\" type=\"submit\" form=\"query-editor\" formaction=\"/db/");
+                    try html.attribute(writer, page.database.id);
+                    try writer.writeAll("/query/file/save\" data-save-button>Save</button>");
+                }
+            } else {
+                try writer.writeAll("<span class=\"query-save-state\">Read-only file</span>");
+            }
+            if (!page.file_conflict) {
+                if (document.revision) |revision| try queryFileActions(writer, page, document.name, &revision);
+            }
         }
         try writer.writeAll("</div>");
     } else {
@@ -453,6 +486,16 @@ fn queryFileHeader(writer: *std.Io.Writer, page: QueryPage) !void {
         try writer.writeAll("</div>");
     }
     try writer.writeAll("</header>");
+}
+
+fn querySaveAsControls(writer: *std.Io.Writer, page: QueryPage, placeholder: []const u8) !void {
+    try writer.writeAll("<label class=\"save-as-label\"><span>Filename</span><input form=\"query-editor\" name=\"new_name\" type=\"text\" maxlength=\"80\" value=\"");
+    try html.attribute(writer, page.new_file_name);
+    try writer.writeAll("\" placeholder=\"");
+    try html.attribute(writer, placeholder);
+    try writer.writeAll("\"></label><button class=\"button\" type=\"submit\" form=\"query-editor\" formaction=\"/db/");
+    try html.attribute(writer, page.database.id);
+    try writer.writeAll("/query/file/create\">Save as file</button>");
 }
 
 fn queryFileActions(
@@ -1012,11 +1055,10 @@ fn shellStart(
     active: Section,
     sidebar_view: ?Sidebar,
 ) !void {
-    // Version 2 bypasses browsers that cached the original unversioned assets;
-    // asset responses are no-store so later deployments cannot go stale again.
+    // Versioned URLs bypass browsers that cached older embedded assets.
     try html.documentStart(writer, .{
         .title = title,
-        .head = .audited("<link rel=\"icon\" href=\"data:,\"><link rel=\"stylesheet\" href=\"/assets/app.css?v=3\"><script src=\"/assets/app.js?v=2\" defer></script>"),
+        .head = .audited("<link rel=\"icon\" href=\"data:,\"><link rel=\"stylesheet\" href=\"/assets/app.css?v=3\"><script src=\"/assets/app.js?v=3\" defer></script>"),
     });
     try writer.writeAll("<header class=\"topbar\"><a class=\"brand\" href=\"/\">dbui</a>");
     if (current) |database| {
@@ -1104,6 +1146,8 @@ fn renderSidebar(writer: *std.Io.Writer, sidebar: Sidebar, active: Section) !voi
         try writer.writeAll("<input type=\"hidden\" name=\"file\" value=\"");
         try html.attribute(writer, name);
         try writer.writeAll("\">");
+    } else if (active == .query and sidebar.scratch_selected) {
+        try writer.writeAll("<input type=\"hidden\" name=\"scratch\" value=\"1\">");
     }
     if (sidebar.show_internal) try writer.writeAll("<input type=\"hidden\" name=\"internal\" value=\"1\">");
     try writer.writeAll("<button type=\"submit\">Search</button></form>");
@@ -1130,6 +1174,9 @@ fn renderSidebar(writer: *std.Io.Writer, sidebar: Sidebar, active: Section) !voi
             try writer.writeAll("file=");
             try urlComponent(writer, name);
             has_parameter = true;
+        } else if (sidebar.scratch_selected) {
+            try writer.writeAll("scratch=1");
+            has_parameter = true;
         }
     }
     if (sidebar.search.len != 0) {
@@ -1151,21 +1198,21 @@ fn queryFileGroup(writer: *std.Io.Writer, sidebar: Sidebar) !void {
     const listing = sidebar.query_files orelse return;
     try writer.writeAll("<section class=\"object-group query-file-group\"><h2>SQL files</h2><ul>");
     try writer.writeAll("<li data-object-name=\"Scratch\"");
-    if (sidebar.current_file == null) try writer.writeAll(" data-current=\"true\"");
+    if (sidebar.scratch_selected) try writer.writeAll(" data-current=\"true\"");
     try writer.writeAll("><a href=\"/db/");
     try html.attribute(writer, sidebar.database.id);
-    try writer.writeAll("/query");
-    var has_parameter = false;
+    try writer.writeAll("/query?scratch=1");
     if (sidebar.search.len != 0) {
-        try writer.writeAll("?q=");
+        try writer.writeAll("&amp;q=");
         try urlComponent(writer, sidebar.search);
-        has_parameter = true;
     }
     if (sidebar.show_internal) {
-        try writer.writeAll(if (has_parameter) "&amp;internal=1" else "?internal=1");
+        try writer.writeAll("&amp;internal=1");
     }
-    if (sidebar.current_file == null) try writer.writeAll("\" aria-current=\"page");
-    try writer.writeAll("\">Scratch<span class=\"query-file-meta\">not saved</span></a></li>");
+    if (sidebar.scratch_selected) try writer.writeAll("\" aria-current=\"page");
+    try writer.writeAll("\">Scratch<span class=\"query-file-meta\">");
+    try writer.writeAll(if (listing.scratch_modified_ns == null) "new" else "autosaved");
+    try writer.writeAll("</span></a></li>");
 
     for (listing.items) |item| {
         const current = if (sidebar.current_file) |name| std.mem.eql(u8, name, item.name) else false;

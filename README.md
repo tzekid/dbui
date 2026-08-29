@@ -59,18 +59,19 @@ The listener is restricted to `127.0.0.1` or `::1`. Keep it behind an authentica
 The Query page can keep ordinary `.sql` files beside the database-object navigation. These are real server files, not records in a dbui control database:
 
 - Files are direct children of the configured query directory; no recursive file browser is exposed.
-- Scratch is unsaved until `Save as file` is used.
+- Scratch is one persistent draft per database, stored as the reserved `.dbui-scratch.sql` workspace file. It is created on the first save, hidden from the named-file list, and automatically saved after 800 ms without editor input.
+- Opening Query selects the most recently written named file or Scratch. Explicit sidebar links always open the selected document.
 - A visible Save action and `Ctrl/Cmd+S` persist the current file.
 - `Ctrl/Cmd+Enter` runs the browser selection when present, otherwise the SQLite statement at the caret.
 - The native textarea is progressively enhanced with SQLite-specific syntax colors; it remains the sole editable and submitted source.
 - Stored object, index, and trigger SQL on Schema pages uses the same optional syntax colors.
 - Results update below the editor without replacing its selection, focus, scroll, or undo state.
-- JavaScript disabled: file lifecycle still works through ordinary forms, and Query executes the whole textarea when it contains exactly one statement.
+- JavaScript disabled: Scratch has a normal Save action, file lifecycle still works through ordinary forms, and Query saves the active document before executing the whole textarea when it contains exactly one statement.
 - A file may contain many statements, but one Run executes exactly one statement. Multi-statement selection and Run All are deliberately deferred.
 
 Files are limited to 64 KiB and valid UTF-8. Browser-submitted CRLF transport is canonicalized back to the editor's LF representation. Existing files preserve consistent LF or CRLF on save. Mixed or bare-CR files, NUL-containing files, invalid UTF-8, oversized files, symlinks, and non-regular files are never silently normalized or followed.
 
-Every file page carries a SHA-256 revision. Save, Run, Rename, and Delete reject stale revisions; a conflict preserves the submitted browser buffer and never silently overwrites the disk file. Saves use same-directory atomic replacement and preserve the existing file permissions. Query files may remain editable even when the database itself is configured read-only; saving SQL never grants permission to execute a database write.
+Every file page carries a SHA-256 revision. Scratch autosave and named-file Save, Run, Rename, and Delete reject stale revisions; a conflict preserves the submitted browser buffer and never silently overwrites the disk file. Saves use same-directory atomic replacement and preserve the existing file permissions. Query files may remain editable even when the database itself is configured read-only; saving SQL never grants permission to execute a database write.
 
 ## Read-only and read/write behavior
 

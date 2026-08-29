@@ -273,15 +273,22 @@
   const scopeLabel = form.querySelector("[data-query-scope-label]");
   const revisionField = form.querySelector("[data-base-revision]");
   const fileField = form.elements.namedItem("file");
+  const scratchField = form.elements.namedItem("scratch");
   const writeCheckbox = form.elements.namedItem("confirm_write");
   const sqlEditor = form.querySelector("[data-sql-editor]");
   const highlightLayer = sqlEditor?.querySelector("[data-sql-highlight]");
   const highlightCode = highlightLayer?.querySelector("code");
   const highlightStatus = form.querySelector("[data-sql-highlight-status]");
   const encoder = new TextEncoder();
-  let dirty = (!fileField && editor.value.length > 0) || Boolean(saveState?.hasAttribute("data-initial-dirty"));
+  const persistentScratch = Boolean(scratchField && saveButton);
+  let dirty = Boolean(saveState?.hasAttribute("data-initial-dirty")) || (!fileField && !scratchField && editor.value.length > 0);
   let busy = false;
   let pendingConfirmation = null;
+  let editGeneration = 0;
+  let scratchSaveTimer = null;
+  let scratchSavePromise = null;
+  let scratchConflict = false;
+  let createAfterSave = false;
 
   function installSqlHighlighting() {
     if (!sqlEditor || !highlightLayer || !highlightCode || !highlightStatus) return;
@@ -368,7 +375,7 @@
 
   function setDirty() {
     dirty = true;
-    if (saveState) saveState.textContent = fileField ? "Unsaved changes" : "Unsaved scratch";
+    if (saveState) saveState.textContent = fileField || persistentScratch ? "Unsaved changes" : "Unsaved scratch";
     clearWriteConfirmation();
     markResultStale();
   }
@@ -431,9 +438,84 @@
     }
   }
 
+  function clearScratchSaveTimer() {
+    if (scratchSaveTimer === null) return;
+    clearTimeout(scratchSaveTimer);
+    scratchSaveTimer = null;
+  }
+
+  function scheduleScratchSave() {
+    if (!persistentScratch || scratchConflict) return;
+    clearScratchSaveTimer();
+    scratchSaveTimer = setTimeout(() => {
+      scratchSaveTimer = null;
+      void saveScratch();
+    }, 800);
+  }
+
+  async function saveScratch() {
+    if (!persistentScratch || scratchConflict) return false;
+    if (scratchSavePromise) return scratchSavePromise;
+    clearScratchSaveTimer();
+    const generation = editGeneration;
+    if (saveState) saveState.textContent = "Saving…";
+    const request = (async () => {
+      try {
+        const response = await fetch(saveButton.formAction, {
+          method: "POST",
+          body: encodedForm({ fragment: "save-state", confirm_write: null }),
+        });
+        if (response.ok && response.headers.has("etag")) {
+          updateRevision(response);
+          if (generation === editGeneration) {
+            dirty = false;
+            if (saveState) saveState.textContent = "Autosaved";
+          } else if (saveState) {
+            saveState.textContent = "Unsaved changes";
+          }
+          return true;
+        }
+        await response.text();
+        scratchConflict = response.status === 409;
+        if (scratchConflict) runButton.disabled = true;
+        if (saveState) saveState.textContent = scratchConflict ? "Conflict" : "Autosave failed";
+        if (responseRegion) {
+          responseRegion.textContent = scratchConflict
+            ? "Scratch changed elsewhere. Reload Scratch or save this buffer as a named file."
+            : "Scratch could not be saved. Your editor buffer is unchanged.";
+        }
+        return false;
+      } catch (_error) {
+        if (saveState) saveState.textContent = "Autosave failed";
+        if (responseRegion) responseRegion.textContent = "The save request could not reach dbui. Your editor buffer is unchanged.";
+        return false;
+      }
+    })();
+    scratchSavePromise = request;
+    const saved = await request;
+    scratchSavePromise = null;
+    if (!scratchConflict && dirty && generation !== editGeneration) scheduleScratchSave();
+    return saved;
+  }
+
+  async function flushScratch() {
+    clearScratchSaveTimer();
+    if (scratchSavePromise) await scratchSavePromise;
+    if (!dirty || scratchConflict) return !dirty;
+    return saveScratch();
+  }
+
+  async function waitForScratchSave() {
+    clearScratchSaveTimer();
+    if (scratchSavePromise) await scratchSavePromise;
+    clearScratchSaveTimer();
+  }
+
   async function runQuery(confirmed = false, reuseScope = false) {
     if (busy || runButton.disabled) return;
     if (fileField && dirty && !(await saveFile())) return;
+    if (persistentScratch) await waitForScratchSave();
+    if (scratchConflict) return;
     if (!reuseScope) updateScope();
     setBusy(true, "Running…");
     const originalLabel = runButton.textContent;
@@ -452,6 +534,10 @@
       if (responseRegion) responseRegion.innerHTML = source;
       pendingConfirmation = responseRegion?.querySelector("[data-confirm-write]") ? scopeKey() : null;
       if (fileField && saveState) saveState.textContent = "Saved";
+      if (persistentScratch && response.headers.has("etag")) {
+        dirty = false;
+        if (saveState) saveState.textContent = "Autosaved";
+      }
     } catch (_error) {
       if (responseRegion) responseRegion.textContent = "The query request could not reach dbui. No result was received.";
       if (fileField && saveState) saveState.textContent = "Saved";
@@ -464,7 +550,9 @@
 
   editor.addEventListener("input", () => {
     if (writeCheckbox) writeCheckbox.checked = false;
+    editGeneration += 1;
     setDirty();
+    scheduleScratchSave();
     updateScope();
   });
   editor.addEventListener("select", () => {
@@ -479,11 +567,32 @@
     const submitter = event.submitter;
     const action = submitter?.formAction || form.action;
     if (action.endsWith("/query/file/create")) {
+      if (createAfterSave) {
+        createAfterSave = false;
+        dirty = false;
+        return;
+      }
+      if (persistentScratch) {
+        clearScratchSaveTimer();
+        if (scratchSavePromise) {
+          event.preventDefault();
+          void (async () => {
+            await waitForScratchSave();
+            createAfterSave = true;
+            form.requestSubmit(submitter);
+            if (createAfterSave) createAfterSave = false;
+          })();
+          return;
+        }
+      }
       dirty = false;
       return;
     }
     event.preventDefault();
-    if (submitter?.hasAttribute("data-save-button")) void saveFile();
+    if (submitter?.hasAttribute("data-save-button")) {
+      if (persistentScratch) void flushScratch();
+      else void saveFile();
+    }
     else void runQuery(Boolean(writeCheckbox?.checked), Boolean(writeCheckbox));
   });
 
@@ -506,7 +615,8 @@
       void runQuery(Boolean(writeCheckbox?.checked), Boolean(writeCheckbox));
     } else if (event.key.toLocaleLowerCase() === "s") {
       event.preventDefault();
-      if (saveButton) void saveFile();
+      if (persistentScratch) void flushScratch();
+      else if (saveButton) void saveFile();
       else document.querySelector("input[name=new_name][form=query-editor]")?.focus();
     }
   });

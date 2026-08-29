@@ -32,6 +32,7 @@ const Handler = enum {
     schema,
     query_get,
     query_post,
+    query_scratch_save,
     query_file_create,
     query_file_save,
     query_file_rename,
@@ -58,6 +59,7 @@ const routes = [_]Route{
     .{ .method = .GET, .pattern = "/db/:database_id/schema", .handler = .schema },
     .{ .method = .GET, .pattern = "/db/:database_id/query", .handler = .query_get },
     .{ .method = .POST, .pattern = "/db/:database_id/query", .handler = .query_post },
+    .{ .method = .POST, .pattern = "/db/:database_id/query/scratch/save", .handler = .query_scratch_save },
     .{ .method = .POST, .pattern = "/db/:database_id/query/file/create", .handler = .query_file_create },
     .{ .method = .POST, .pattern = "/db/:database_id/query/file/save", .handler = .query_file_save },
     .{ .method = .POST, .pattern = "/db/:database_id/query/file/rename", .handler = .query_file_rename },
@@ -72,6 +74,12 @@ const Outcome = struct {
     status: std.http.Status,
     database_id: []const u8 = "-",
     route_name: []const u8,
+};
+
+const QueryTarget = union(enum) {
+    latest,
+    scratch,
+    file: []const u8,
 };
 
 pub fn run(gpa: std.mem.Allocator, io: std.Io, context: *Context) !void {
@@ -162,6 +170,7 @@ fn dispatch(context: *Context, request_context: *web_app.RequestContext, request
                 .schema => schemaPage(context, request_context, target, database_id, request_id),
                 .query_get => queryGet(context, request_context, target, database_id, request_id),
                 .query_post => queryPost(context, request_context, target, database_id, request_id),
+                .query_scratch_save => queryScratchSave(context, request_context, database_id, request_id),
                 .query_file_create => queryFileCreate(context, request_context, database_id, request_id),
                 .query_file_save => queryFileSave(context, request_context, database_id, request_id),
                 .query_file_rename => queryFileRename(context, request_context, database_id, request_id),
@@ -396,6 +405,23 @@ fn queryGet(
         try problem(context, request_context, configured, .bad_request, "Invalid parameters", "The query parameters are malformed or ambiguous.", request_id);
         return .{ .status = .bad_request, .database_id = configured.id, .route_name = "query" };
     };
+    const scratch_requested = queryScratchRequested(parameters) catch {
+        try problem(context, request_context, configured, .bad_request, "Invalid parameters", "Choose either Scratch or one named SQL file.", request_id);
+        return .{ .status = .bad_request, .database_id = configured.id, .route_name = "query" };
+    };
+    if (configured.queries_path) |workspace_path| {
+        if (parameters.get("file") == null and !scratch_requested) {
+            const listing = query_files.list(request_context.arena, request_context.io, workspace_path) catch |err| {
+                return queryWorkspaceError(context, request_context, configured, "query", request_id, err);
+            };
+            const query_target: QueryTarget = if (listing.latest()) |latest| switch (latest) {
+                .scratch => .scratch,
+                .file => |name| .{ .file = name },
+            } else .scratch;
+            try redirectQueryTarget(request_context, configured.id, query_target, parameters, null, .found);
+            return .{ .status = .found, .database_id = configured.id, .route_name = "query" };
+        }
+    }
     var database = sqlite.Database.open(request_context.arena, configured.path, configured.mode) catch |err| {
         return unavailable(context, request_context, configured, "query", request_id, err);
     };
@@ -467,7 +493,7 @@ fn queryPost(
             .unprocessable_entity,
             request_id,
             false,
-            fields.get("file") != null,
+            fields.get("file") != null or fields.get("scratch") != null,
             fields.get("new_name") orelse "",
             "query",
         );
@@ -530,6 +556,63 @@ fn queryPost(
             return queryWorkspaceError(context, request_context, configured, "query", request_id, err);
         };
         sidebar.current_file = file_name;
+    } else if (queryScratchRequested(fields) catch false) {
+        const workspace_path = configured.queries_path orelse {
+            return queryWorkspaceError(context, request_context, configured, "query", request_id, error.QueryWorkspaceUnavailable);
+        };
+        if (document == null or !document.?.editable()) {
+            return renderQueryFileFailure(context, request_context, configured, sidebar, document, sql, "Scratch cannot be edited in dbui.", .unprocessable_entity, request_id, false, false, "", "query");
+        }
+        const base_revision = fields.get("base_revision") orelse "";
+        const saved = query_files.saveScratch(
+            request_context.arena,
+            request_context.io,
+            workspace_path,
+            base_revision,
+            sql,
+        ) catch |err| {
+            const conflict = err == error.FileConflict or err == error.PathAlreadyExists;
+            if (conflict) {
+                var conflict_document = document.?;
+                conflict_document.source = sql;
+                if (formRevision(base_revision)) |revision| conflict_document.revision = revision;
+                return renderQueryFileFailure(
+                    context,
+                    request_context,
+                    configured,
+                    sidebar,
+                    conflict_document,
+                    sql,
+                    "Scratch changed on disk. Your edits were not saved or executed.",
+                    .conflict,
+                    request_id,
+                    true,
+                    true,
+                    "",
+                    "query",
+                );
+            }
+            return renderQueryFileFailure(
+                context,
+                request_context,
+                configured,
+                sidebar,
+                document,
+                sql,
+                queryFileErrorMessage(err),
+                queryFileErrorStatus(err),
+                request_id,
+                false,
+                true,
+                "",
+                "query",
+            );
+        };
+        saved_before_run = saved.changed;
+        document = query_files.loadScratch(request_context.arena, request_context.io, workspace_path) catch |err| {
+            return queryWorkspaceError(context, request_context, configured, "query", request_id, err);
+        };
+        sidebar.scratch_selected = true;
     }
     const scope = query_mod.Scope.parse(fields.get("scope") orelse "whole") catch {
         return renderQueryExecutionFailure(context, request_context, configured, &database, sidebar, document, sql, saved_before_run, error.InvalidExecutionScope, .whole, 0, 0, 0, request_id, fragment_requested);
@@ -646,6 +729,59 @@ fn queryPost(
     return .{ .status = .ok, .database_id = configured.id, .route_name = "query" };
 }
 
+fn queryScratchSave(
+    context: *Context,
+    request_context: *web_app.RequestContext,
+    database_id: []const u8,
+    request_id: u64,
+) !Outcome {
+    const configured = context.registry.find(database_id) orelse {
+        request_context.request.head.keep_alive = false;
+        try problem(context, request_context, null, .not_found, "Database not found", "That database is not configured.", request_id);
+        return .{ .status = .not_found, .database_id = database_id, .route_name = "query_scratch_save" };
+    };
+    const workspace_path = configured.queries_path orelse {
+        try problem(context, request_context, configured, .not_found, "Scratch unavailable", "This database has no configured query directory.", request_id);
+        return .{ .status = .not_found, .database_id = configured.id, .route_name = "query_scratch_save" };
+    };
+    const fields = readSourceForm(context, request_context) catch |err| {
+        return sourceFormError(context, request_context, configured, "query_scratch_save", request_id, err);
+    };
+    if (!(queryScratchRequested(fields) catch false)) {
+        try problem(context, request_context, configured, .bad_request, "Invalid Scratch save", "The Scratch document marker is missing or invalid.", request_id);
+        return .{ .status = .bad_request, .database_id = configured.id, .route_name = "query_scratch_save" };
+    }
+    const source = fields.get("sql") orelse "";
+    const saved = query_files.saveScratch(
+        request_context.arena,
+        request_context.io,
+        workspace_path,
+        fields.get("base_revision") orelse "",
+        source,
+    ) catch |err| {
+        const conflict = err == error.FileConflict or err == error.PathAlreadyExists;
+        std.log.warn("event=query_file_error database={s} route=scratch_save error={s}", .{ configured.id, @errorName(err) });
+        return renderQueryFieldsFailure(
+            context,
+            request_context,
+            configured,
+            fields,
+            source,
+            if (conflict) "Scratch changed on disk. Your edits were not saved." else queryFileErrorMessage(err),
+            queryFileErrorStatus(err),
+            request_id,
+            conflict,
+            "query_scratch_save",
+        );
+    };
+    if (std.mem.eql(u8, fields.get("fragment") orelse "", "save-state")) {
+        try respondSaveState(request_context, saved.revision);
+        return .{ .status = .ok, .database_id = configured.id, .route_name = "query_scratch_save" };
+    }
+    try redirectQuery(request_context, configured.id, .scratch, fields, "saved");
+    return .{ .status = .see_other, .database_id = configured.id, .route_name = "query_scratch_save" };
+}
+
 fn queryFileCreate(
     context: *Context,
     request_context: *web_app.RequestContext,
@@ -682,7 +818,7 @@ fn queryFileCreate(
             "query_file_create",
         );
     };
-    try redirectQuery(request_context, configured.id, name, fields, "created");
+    try redirectQuery(request_context, configured.id, .{ .file = name }, fields, "created");
     return .{ .status = .see_other, .database_id = configured.id, .route_name = "query_file_create" };
 }
 
@@ -733,7 +869,7 @@ fn queryFileSave(
         try respondSaveState(request_context, saved.revision);
         return .{ .status = .ok, .database_id = configured.id, .route_name = "query_file_save" };
     }
-    try redirectQuery(request_context, configured.id, name, fields, "saved");
+    try redirectQuery(request_context, configured.id, .{ .file = name }, fields, "saved");
     return .{ .status = .see_other, .database_id = configured.id, .route_name = "query_file_save" };
 }
 
@@ -769,7 +905,7 @@ fn queryFileRename(
         try problem(context, request_context, configured, queryFileErrorStatus(err), "Rename failed", queryFileErrorMessage(err), request_id);
         return .{ .status = queryFileErrorStatus(err), .database_id = configured.id, .route_name = "query_file_rename" };
     };
-    try redirectQuery(request_context, configured.id, new_name, fields, "renamed");
+    try redirectQuery(request_context, configured.id, .{ .file = new_name }, fields, "renamed");
     return .{ .status = .see_other, .database_id = configured.id, .route_name = "query_file_rename" };
 }
 
@@ -807,7 +943,7 @@ fn queryFileDelete(
         try problem(context, request_context, configured, queryFileErrorStatus(err), "Delete failed", queryFileErrorMessage(err), request_id);
         return .{ .status = queryFileErrorStatus(err), .database_id = configured.id, .route_name = "query_file_delete" };
     };
-    try redirectQuery(request_context, configured.id, null, fields, "deleted");
+    try redirectQuery(request_context, configured.id, .latest, fields, "deleted");
     return .{ .status = .see_other, .database_id = configured.id, .route_name = "query_file_delete" };
 }
 
@@ -1160,6 +1296,7 @@ fn loadQueryWorkspace(
     sidebar: *views.Sidebar,
 ) !?query_files.Document {
     const file_name = parameters.get("file");
+    const scratch_requested = try queryScratchRequested(parameters);
     const workspace_path = configured.queries_path orelse {
         if (file_name != null) return error.QueryWorkspaceUnavailable;
         return null;
@@ -1170,7 +1307,18 @@ fn loadQueryWorkspace(
         sidebar.current_file = document.name;
         return document;
     }
+    if (scratch_requested) {
+        const document = try query_files.loadScratch(allocator, io, workspace_path);
+        sidebar.scratch_selected = true;
+        return document;
+    }
     return null;
+}
+
+fn queryScratchRequested(parameters: http_params.Parameters) !bool {
+    const value = parameters.get("scratch") orelse return false;
+    if (!std.mem.eql(u8, value, "1") or parameters.get("file") != null) return error.InvalidQueryTarget;
+    return true;
 }
 
 fn queryNotice(parameters: http_params.Parameters) ?[]const u8 {
@@ -1256,7 +1404,7 @@ fn renderQueryFieldsFailure(
         status,
         request_id,
         effective_conflict,
-        fields.get("file") != null,
+        fields.get("file") != null or fields.get("scratch") != null,
         fields.get("new_name") orelse "",
         route_name,
     );
@@ -1298,7 +1446,7 @@ fn queryFileErrorStatus(err: anyerror) std.http.Status {
     return switch (err) {
         error.FileNotFound, error.QueryWorkspaceUnavailable, error.SymLinkLoop, error.FileNotRegular, error.IsDir => .not_found,
         error.FileConflict, error.FileChangedDuringRead, error.PathAlreadyExists => .conflict,
-        error.InvalidFilename, error.InvalidRevision => .bad_request,
+        error.InvalidFilename, error.InvalidRevision, error.InvalidQueryTarget => .bad_request,
         error.SourceTooLarge, error.InvalidUtf8, error.ContainsNul, error.UnsupportedLineEndings, error.FileNotEditable, error.FileTooLarge, error.TooManyWorkspaceEntries, error.TooManyQueryFiles => .unprocessable_entity,
         error.NoSpaceLeft, error.DiskQuota => .insufficient_storage,
         error.AccessDenied, error.PermissionDenied, error.ReadOnlyFileSystem => .service_unavailable,
@@ -1314,6 +1462,7 @@ fn queryFileErrorMessage(err: anyerror) []const u8 {
         error.PathAlreadyExists => "A SQL file with that name already exists.",
         error.InvalidFilename => "Use a direct UTF-8 filename ending in .sql, with at most 80 bytes and no path separators or control characters.",
         error.InvalidRevision => "The SQL file revision is malformed. Reload the page and try again.",
+        error.InvalidQueryTarget => "Choose either Scratch or one named SQL file.",
         error.SourceTooLarge, error.FileTooLarge => "SQL files are limited to 64 KiB.",
         error.InvalidUtf8 => "SQL files must contain valid UTF-8.",
         error.ContainsNul => "SQL files cannot contain NUL bytes.",
@@ -1340,17 +1489,35 @@ fn submittedSourceErrorMessage(err: anyerror) []const u8 {
 fn redirectQuery(
     request_context: *web_app.RequestContext,
     database_id: []const u8,
-    file_name: ?[]const u8,
+    target: QueryTarget,
     fields: http_params.Parameters,
     notice: []const u8,
+) !void {
+    return redirectQueryTarget(request_context, database_id, target, fields, notice, .see_other);
+}
+
+fn redirectQueryTarget(
+    request_context: *web_app.RequestContext,
+    database_id: []const u8,
+    target: QueryTarget,
+    fields: http_params.Parameters,
+    notice: ?[]const u8,
+    status: std.http.Status,
 ) !void {
     var location: std.Io.Writer.Allocating = .init(request_context.arena);
     try location.writer.print("/db/{s}/query?", .{database_id});
     var has_parameter = false;
-    if (file_name) |name| {
-        try location.writer.writeAll("file=");
-        try writeUrlComponent(&location.writer, name);
-        has_parameter = true;
+    switch (target) {
+        .latest => {},
+        .scratch => {
+            try location.writer.writeAll("scratch=1");
+            has_parameter = true;
+        },
+        .file => |name| {
+            try location.writer.writeAll("file=");
+            try writeUrlComponent(&location.writer, name);
+            has_parameter = true;
+        },
     }
     if (fields.get("q")) |search| {
         if (search.len != 0) {
@@ -1365,9 +1532,23 @@ fn redirectQuery(
         try location.writer.writeAll("internal=1");
         has_parameter = true;
     }
-    if (has_parameter) try location.writer.writeByte('&');
-    try location.writer.print("{s}=1", .{notice});
-    try response.redirect(request_context.request, location.written(), .see_other, &security_headers);
+    if (notice) |name| {
+        if (has_parameter) try location.writer.writeByte('&');
+        try location.writer.print("{s}=1", .{name});
+        has_parameter = true;
+    } else {
+        for ([_][]const u8{ "created", "saved", "renamed", "deleted" }) |name| {
+            if (std.mem.eql(u8, fields.get(name) orelse "", "1")) {
+                if (has_parameter) try location.writer.writeByte('&');
+                try location.writer.print("{s}=1", .{name});
+                has_parameter = true;
+                break;
+            }
+        }
+    }
+    const written = location.written();
+    const final_location = if (has_parameter) written else written[0 .. written.len - 1];
+    try response.redirect(request_context.request, final_location, status, &security_headers);
 }
 
 fn encodeUrlComponent(allocator: std.mem.Allocator, value: []const u8) ![]u8 {

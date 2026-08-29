@@ -77,7 +77,7 @@ grep -qi '^content-security-policy:' "$runtime_dir/headers"
 grep -qi '^cache-control: no-store' "$runtime_dir/headers"
 grep -q 'Fixture read-only' "$runtime_dir/index.html"
 grep -q 'href="/assets/app.css?v=3"' "$runtime_dir/index.html"
-grep -q 'src="/assets/app.js?v=2"' "$runtime_dir/index.html"
+grep -q 'src="/assets/app.js?v=3"' "$runtime_dir/index.html"
 
 mv "$ro_db" "$runtime_dir/fixture-ro.offline"
 curl --silent --fail http://127.0.0.1:17432/ -o "$runtime_dir/index-unavailable.html"
@@ -132,7 +132,11 @@ if grep -Fq '.sidebar-disclosure:not([open]) > .sidebar-body { display: block; }
 fi
 grep -Fq '.sidebar-disclosure:not([open]) > summary { display: list-item;' "$runtime_dir/app.css"
 
-curl --silent --fail http://127.0.0.1:17432/db/fixture/query -o "$runtime_dir/query.html"
+status=$(curl --silent --dump-header "$runtime_dir/query-default.headers" http://127.0.0.1:17432/db/fixture/query -o /dev/null -w '%{http_code}')
+[[ $status == 302 ]]
+grep -qi '^location: /db/fixture/query?file=crlf.sql' "$runtime_dir/query-default.headers"
+[[ ! -e "$queries_dir/.dbui-scratch.sql" ]]
+curl --silent --fail 'http://127.0.0.1:17432/db/fixture/query?scratch=1' -o "$runtime_dir/query.html"
 csrf=$(sed -n 's/.*name="csrf_token" value="\([^"]*\)".*/\1/p' "$runtime_dir/query.html")
 [[ ${#csrf} -eq 64 ]]
 grep -q 'Search files and objects' "$runtime_dir/query.html"
@@ -141,14 +145,47 @@ grep -q 'data-sql-editor' "$runtime_dir/query.html"
 grep -q 'data-sql-highlight aria-hidden="true" inert' "$runtime_dir/query.html"
 grep -q '<textarea id="sql" name="sql" data-sql' "$runtime_dir/query.html"
 if grep -q 'hidden-link.sql' "$runtime_dir/query.html"; then
-    echo 'query sidebar exposed a symlink' >&2
-    exit 1
+  echo 'query sidebar exposed a symlink' >&2
+  exit 1
 fi
+if grep -q '.dbui-scratch.sql' "$runtime_dir/query.html"; then
+  echo 'query sidebar exposed the reserved Scratch file' >&2
+  exit 1
+fi
+
+status=$(curl --silent --data-urlencode "csrf_token=$csrf" --data-urlencode 'scratch=1' --data-urlencode 'base_revision=' --data-urlencode "sql=SELECT 'scratch-start';" --data-urlencode 'fragment=save-state' http://127.0.0.1:17432/db/fixture/query/scratch/save -o "$runtime_dir/scratch-save.txt" -D "$runtime_dir/scratch-save.headers" -w '%{http_code}')
+[[ $status == 200 ]]
+scratch_revision=$(sed -n 's/^etag: "\([0-9a-f]*\)".*/\1/ip' "$runtime_dir/scratch-save.headers")
+[[ ${#scratch_revision} -eq 64 ]]
+[[ $(cat "$queries_dir/.dbui-scratch.sql") == "SELECT 'scratch-start';" ]]
+curl --silent --fail 'http://127.0.0.1:17432/db/fixture/query?scratch=1' -o "$runtime_dir/scratch.html"
+grep -q "scratch-start" "$runtime_dir/scratch.html"
 
 status=$(curl --silent --data-urlencode "csrf_token=$csrf" --data-urlencode 'new_name=daily-health.sql' --data-urlencode 'sql=SELECT 2;' http://127.0.0.1:17432/db/fixture/query/file/create -o "$runtime_dir/create.html" -D "$runtime_dir/create.headers" -w '%{http_code}')
 [[ $status == 303 ]]
 [[ $(cat "$queries_dir/daily-health.sql") == 'SELECT 2;' ]]
 grep -qi '^location: /db/fixture/query?file=daily-health.sql.*created=1' "$runtime_dir/create.headers"
+
+status=$(curl --silent --dump-header "$runtime_dir/query-named-default.headers" http://127.0.0.1:17432/db/fixture/query -o /dev/null -w '%{http_code}')
+[[ $status == 302 ]]
+grep -qi '^location: /db/fixture/query?file=daily-health.sql' "$runtime_dir/query-named-default.headers"
+
+status=$(curl --silent --data-urlencode "csrf_token=$csrf" --data-urlencode 'scratch=1' --data-urlencode "base_revision=$scratch_revision" --data-urlencode "sql=SELECT 'scratch-newest';" --data-urlencode 'fragment=save-state' http://127.0.0.1:17432/db/fixture/query/scratch/save -o "$runtime_dir/scratch-update.txt" -D "$runtime_dir/scratch-update.headers" -w '%{http_code}')
+[[ $status == 200 ]]
+current_scratch_revision=$(sed -n 's/^etag: "\([0-9a-f]*\)".*/\1/ip' "$runtime_dir/scratch-update.headers")
+[[ ${#current_scratch_revision} -eq 64 ]]
+status=$(curl --silent --dump-header "$runtime_dir/query-scratch-default.headers" http://127.0.0.1:17432/db/fixture/query -o /dev/null -w '%{http_code}')
+[[ $status == 302 ]]
+grep -qi '^location: /db/fixture/query?scratch=1' "$runtime_dir/query-scratch-default.headers"
+
+status=$(curl --silent --data-urlencode "csrf_token=$csrf" --data-urlencode 'scratch=1' --data-urlencode "base_revision=$scratch_revision" --data-urlencode "sql=SELECT 'stale-scratch';" --data-urlencode 'fragment=save-state' http://127.0.0.1:17432/db/fixture/query/scratch/save -o "$runtime_dir/scratch-conflict.html" -w '%{http_code}')
+[[ $status == 409 ]]
+[[ $(cat "$queries_dir/.dbui-scratch.sql") == "SELECT 'scratch-newest';" ]]
+
+status=$(curl --silent --data-urlencode "csrf_token=$csrf" --data-urlencode 'scratch=1' --data-urlencode "base_revision=$current_scratch_revision" --data-urlencode "sql=SELECT 'scratch-result';" http://127.0.0.1:17432/db/fixture/query -o "$runtime_dir/scratch-run.html" -w '%{http_code}')
+[[ $status == 200 ]]
+grep -q 'scratch-result' "$runtime_dir/scratch-run.html"
+[[ $(cat "$queries_dir/.dbui-scratch.sql") == "SELECT 'scratch-result';" ]]
 
 status=$(curl --silent --data-urlencode "csrf_token=$csrf" --data-urlencode 'new_name=native-newlines.sql' --data-urlencode $'sql=SELECT 1;\r\nSELECT 2;\r\n' http://127.0.0.1:17432/db/fixture/query/file/create -o "$runtime_dir/native-create.html" -w '%{http_code}')
 [[ $status == 303 ]]
