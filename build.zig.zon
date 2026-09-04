@@ -4,8 +4,8 @@
     .fingerprint = 0xb875f449e0c985d9,
     .minimum_zig_version = "0.17.0-dev.1963+e00c6c439",
     .dependencies = .{
-        // dbui is deployed beside the owner's existing web.zig checkout.
-        .web = .{ .path = "../web.zig" },
+        // Compatible source snapshot; see vendor/web/PROVENANCE.md.
+        .web = .{ .path = "vendor/web" },
     },
     .paths = .{
         "build.zig",
@@ -17,6 +17,8 @@
         "vendor",
         "testdata",
         "tests",
+        "package.json",
+        "package-lock.json",
         "examples",
         "deploy",
         "README.md",

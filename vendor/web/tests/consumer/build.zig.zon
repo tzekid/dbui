@@ -1,0 +1,14 @@
+.{
+    .name = .web_consumer_smoke,
+    .version = "0.0.0",
+    .minimum_zig_version = "0.17.0-dev.1509+bb296ab9b",
+    .dependencies = .{
+        .web = .{ .path = "../.." },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+    .fingerprint = 0xff76a8625ac257f0,
+}

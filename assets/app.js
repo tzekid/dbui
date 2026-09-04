@@ -312,7 +312,8 @@
   let editGeneration = 0;
   let scratchSaveTimer = null;
   let scratchSavePromise = null;
-  let scratchConflict = false;
+  let scratchConflict = persistentScratch && fileConflict;
+  let scratchRecoveryValue = null;
   let createAfterSave = false;
   let executionRange = null;
   let executionRangeKey = null;
@@ -579,6 +580,16 @@
     revisionField.value = etag.replace(/^W\//, "").replace(/^"|"$/g, "");
   }
 
+  function acknowledgeSave(response, generation) {
+    updateRevision(response);
+    dirty = generation !== editGeneration;
+    if (persistentScratch) {
+      if (dirty) storeScratchRecovery(true);
+      else clearScratchRecovery();
+    }
+    if (saveState) saveState.textContent = dirty ? "Unsaved changes" : persistentScratch ? "Saved on server" : "Saved";
+  }
+
   function encodedForm(extra) {
     const values = new URLSearchParams(new FormData(form));
     for (const [name, value] of Object.entries(extra)) {
@@ -591,20 +602,26 @@
   function clearScratchRecovery() {
     if (!scratchRecoveryKey) return;
     try {
-      localStorage.removeItem(scratchRecoveryKey);
+      if (localStorage.getItem(scratchRecoveryKey) === scratchRecoveryValue) {
+        localStorage.removeItem(scratchRecoveryKey);
+        scratchRecoveryValue = null;
+      }
     } catch (_error) {
       // Server persistence remains authoritative when browser storage is unavailable.
     }
   }
 
-  function storeScratchRecovery() {
+  function storeScratchRecovery(onlyIfOwned = false) {
     if (!scratchRecoveryKey) return;
     try {
-      localStorage.setItem(scratchRecoveryKey, JSON.stringify({
+      if (onlyIfOwned && localStorage.getItem(scratchRecoveryKey) !== scratchRecoveryValue) return;
+      const encoded = JSON.stringify({
         version: 1,
         revision: revisionField?.value || "",
         source: editor.value,
-      }));
+      });
+      localStorage.setItem(scratchRecoveryKey, encoded);
+      scratchRecoveryValue = encoded;
     } catch (_error) {
       // Keepalive server saves remain available when browser storage is disabled.
     }
@@ -616,6 +633,7 @@
     try {
       const encoded = localStorage.getItem(scratchRecoveryKey);
       if (!encoded) return;
+      scratchRecoveryValue = encoded;
       recovery = JSON.parse(encoded);
     } catch (_error) {
       clearScratchRecovery();
@@ -631,7 +649,7 @@
       return;
     }
     if (recovery.source === editor.value) {
-      clearScratchRecovery();
+      if (!dirty) clearScratchRecovery();
       return;
     }
 
@@ -663,7 +681,11 @@
     }
   }
 
-  function replaceFullPage(source) {
+  function replaceFullPage(source, generation) {
+    if (generation !== editGeneration) {
+      if (responseRegion) responseRegion.textContent = "The response belongs to an older edit. Your newer editor buffer is unchanged. Copy this buffer before reloading.";
+      return;
+    }
     dirty = false;
     document.open();
     document.write(source);
@@ -673,19 +695,18 @@
   async function saveFile() {
     if (!saveButton || busy) return !saveButton;
     setBusy(true, "Saving…");
+    const generation = editGeneration;
     try {
       const response = await fetch(saveButton.formAction, {
         method: "POST",
         body: encodedForm({ fragment: "save-state", confirm_write: null }),
       });
       if (response.ok && response.headers.has("etag")) {
-        updateRevision(response);
-        dirty = false;
-        if (saveState) saveState.textContent = "Saved";
-        return true;
+        acknowledgeSave(response, generation);
+        return !dirty;
       }
       const source = await response.text();
-      if (/^\s*<!doctype html>/i.test(source)) replaceFullPage(source);
+      if (/^\s*<!doctype html>/i.test(source)) replaceFullPage(source, generation);
       else if (responseRegion) responseRegion.innerHTML = source;
       if (saveState) saveState.textContent = response.status === 409 ? "Conflict" : "Save failed";
       return false;
@@ -705,7 +726,7 @@
   }
 
   function scheduleScratchSave() {
-    if (!persistentScratch || scratchConflict) return;
+    if (!persistentScratch || scratchConflict || busy) return;
     clearScratchSaveTimer();
     scratchSaveTimer = setTimeout(() => {
       scratchSaveTimer = null;
@@ -714,7 +735,7 @@
   }
 
   async function saveScratch(keepalive = false) {
-    if (!persistentScratch || scratchConflict) return false;
+    if (!persistentScratch || scratchConflict || busy) return false;
     if (scratchSavePromise) return scratchSavePromise;
     clearScratchSaveTimer();
     const generation = editGeneration;
@@ -727,15 +748,7 @@
           keepalive,
         });
         if (response.ok && response.headers.has("etag")) {
-          updateRevision(response);
-          if (generation === editGeneration) {
-            dirty = false;
-            clearScratchRecovery();
-            if (saveState) saveState.textContent = "Saved on server";
-          } else {
-            storeScratchRecovery();
-            if (saveState) saveState.textContent = "Unsaved changes";
-          }
+          acknowledgeSave(response, generation);
           return true;
         }
         await response.text();
@@ -780,7 +793,10 @@
     if (persistentScratch) await waitForScratchSave();
     if (scratchConflict) return;
     if (!reuseScope && !(await prepareExecutionScope())) return;
+    if (busy || scratchConflict) return;
     setBusy(true, "Running…");
+    const generation = editGeneration;
+    const requestedScope = scopeKey();
     const originalLabel = runButton.textContent;
     runButton.textContent = "Running…";
     try {
@@ -790,25 +806,24 @@
       });
       const source = await response.text();
       if (/^\s*<!doctype html>/i.test(source)) {
-        replaceFullPage(source);
+        replaceFullPage(source, generation);
         return;
       }
-      updateRevision(response);
       if (responseRegion) responseRegion.innerHTML = source;
-      pendingConfirmation = responseRegion?.querySelector("[data-confirm-write]") ? scopeKey() : null;
-      if (fileField && saveState) saveState.textContent = "Saved";
-      if (persistentScratch && response.headers.has("etag")) {
-        dirty = false;
-        clearScratchRecovery();
-        if (saveState) saveState.textContent = "Saved on server";
+      pendingConfirmation = responseRegion?.querySelector("[data-confirm-write]") ? requestedScope : null;
+      if (persistentScratch && response.headers.has("etag")) acknowledgeSave(response, generation);
+      else updateRevision(response);
+      if (generation !== editGeneration || requestedScope !== scopeKey()) {
+        clearWriteConfirmation();
+        markResultStale();
       }
     } catch (_error) {
       if (responseRegion) responseRegion.textContent = "The query request could not reach dbui. No result was received.";
-      if (fileField && saveState) saveState.textContent = "Saved";
     } finally {
       setBusy(false);
       runButton.textContent = originalLabel;
       updateScope();
+      if (persistentScratch && dirty) scheduleScratchSave();
     }
   }
 

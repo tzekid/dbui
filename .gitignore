@@ -2,3 +2,5 @@
 /zig-out/
 /testdata/*.db
 /testdata/runtime-*.json
+
+/node_modules/

@@ -1,0 +1,22 @@
+.{
+    .name = .web,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.17.0-dev.1509+bb296ab9b",
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "LICENSE",
+        "src",
+        "tests",
+        "tools",
+        "vendor",
+        "docs",
+        "README.md",
+        "SECURITY.md",
+        "CHANGELOG.md",
+        ".zigversion",
+        ".zig-sha256",
+        "PROVENANCE.md",
+    },
+    .fingerprint = 0x15c93851a31973fd,
+}

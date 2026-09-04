@@ -1,0 +1,5 @@
+version=v4.0.0-beta6
+commit=6ca11fbdc881a96c5fbeb0d7094a77183120ea22
+artifact=https://github.com/bigskysoftware/htmx/releases/download/v4.0.0-beta6/htmx.min.js
+sha256=28fae7bbe8e8142b702debb9d5234a9a436d9435a4b5165b195aa1a7ed840d25
+license=0BSD

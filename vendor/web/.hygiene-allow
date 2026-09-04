@@ -1,0 +1,14 @@
+# Hygiene allowlist (ecosystem/03-conventions.md). Every entry justified.
+# Timed condition waits: Timeout is the expected control-flow outcome.
+src/app\.zig:.*waitTimeout.*catch \{\};
+# Best-effort responses on already-failing connections (503, 431, 500):
+src/app\.zig:.*writeAll\(busy_response\) catch \{\};
+src/app\.zig:.*\.flush\(\) catch \{\};
+src/app\.zig:.*respondServerError\(request\) catch \{\};
+src/app\.zig:.*writeHeaderTooLarge.*catch \{\};
+# Test-only sleeps and expected-failure result in journeys:
+src/app\.zig:.*Timeout\.sleep.*catch \{\};
+src/app\.zig:.*TestHarness\.run_result catch \{\};
+# bufPrint of fixed-width formats into correctly sized buffers:
+src/app\.zig:5..:.*catch unreachable
+src/cache\.zig:.*bufPrint.*\{x\}.*catch unreachable

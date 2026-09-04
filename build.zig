@@ -28,7 +28,12 @@ pub fn build(b: *std.Build) void {
 
     const acceptance = b.addSystemCommand(&.{ "bash", "tests/e2e.sh" });
     acceptance.addArtifactArg(executable);
-    b.step("acceptance", "Run the disposable real-process product journey").dependOn(&acceptance.step);
+    const browser = b.addSystemCommand(&.{ "node", "tests/browser.mjs" });
+    browser.addArtifactArg(executable);
+    b.step("browser-acceptance", "Run real-browser editor recovery and native forms").dependOn(&browser.step);
+    const product = b.step("acceptance", "Run disposable HTTP and browser product journeys");
+    product.dependOn(&acceptance.step);
+    product.dependOn(&browser.step);
 }
 
 fn applicationModule(

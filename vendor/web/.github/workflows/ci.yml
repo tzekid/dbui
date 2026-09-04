@@ -1,0 +1,46 @@
+# Ecosystem CI floor (ecosystem/03-conventions.md §7). Copy per repo; add
+# repo-specific jobs alongside — never remove floor gates.
+name: ci
+on: [push, pull_request]
+jobs:
+  floor:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # 1. pin gate — install exactly .zigversion, verify sha
+      - name: toolchain cache
+        id: zig-cache
+        uses: actions/cache@v4
+        with:
+          path: zig-toolchain
+          key: zig-${{ hashFiles('.zigversion', '.zig-sha256') }}
+      - name: fetch toolchain
+        if: steps.zig-cache.outputs.cache-hit != 'true'
+        run: |
+          version="$(cat .zigversion)"
+          expected="$(awk '$1 == "x86_64-linux" { print $2 }' .zig-sha256)"
+          curl -fLo zig.tar.xz "https://ziglang.org/builds/zig-x86_64-linux-${version}.tar.xz"
+          echo "${expected}  zig.tar.xz" | sha256sum -c -
+          mkdir -p zig-toolchain && tar xf zig.tar.xz -C zig-toolchain --strip-components=1
+      - run: echo "$PWD/zig-toolchain" >> "$GITHUB_PATH"
+      - run: test "$(zig version)" = "$(cat .zigversion)"
+      # 2. fmt gate
+      - run: zig fmt --check .
+      # 3. unit gate — the test step must succeed AND the tree must contain
+      # real test blocks (an empty compile-forcing harness does not count;
+      # this Zig's summary omits counts on success, so presence is checked
+      # in-source).
+      - run: zig build test --summary all
+      - run: test "$(grep -rE '^ *test ' src/ | wc -l)" -ge 1
+      # 4. journey gate — repos define a `journeys` build step
+      - run: |
+          if zig build -l | grep -q '^  journeys'; then
+            zig build journeys --summary all
+          else
+            echo "::warning::no journeys step defined yet"
+          fi
+      # 5. hygiene gate (warn-only until the repo flips it)
+      - run: |
+          if [ -x tools/hygiene-check.sh ]; then
+            sh tools/hygiene-check.sh || echo "::warning::hygiene violations (warn-only)"
+          fi

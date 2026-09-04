@@ -15,10 +15,10 @@ Every database request opens one SQLite connection, configures it, copies all re
 ## Prerequisites and pins
 
 - Zig `0.17.0-dev.1963+e00c6c439` (see `.zigversion` and `.zig-sha256`)
-- The sibling `../web.zig` checkout used by the existing VPS Zig ecosystem
+- Compatible `web.zig` source frozen under `vendor/web` (revision and license in `vendor/web/PROVENANCE.md`); no sibling checkout required
 - A C compiler and libc, invoked by Zig
 - SQLite `3.53.4`, vendored under `vendor/sqlite`
-- `sqlite3` and `curl` only for the optional real-process acceptance journey
+- `sqlite3`, `curl`, Node.js, and system Chromium only for acceptance journeys
 
 The SQLite amalgamation archive is pinned in `vendor/sqlite/SHA3SUM`. SQLite is compiled directly by `build.zig` with `SQLITE_OMIT_LOAD_EXTENSION`; no Make, CMake, Node, Python, or frontend build is involved.
 
@@ -26,11 +26,12 @@ The SQLite amalgamation archive is pinned in `vendor/sqlite/SHA3SUM`. SQLite is 
 
 ```sh
 zig build test
+npm ci --ignore-scripts
 zig build acceptance
 zig build -Doptimize=ReleaseSafe
 ```
 
-`zig build test` contains a few focused binary-format, parsing, escaping, and boundary tests. `zig build acceptance` is one vertical real-process journey using a disposable SQLite fixture, loopback HTTP, native forms, SQL limits, and structured mutations.
+`zig build test` contains a few focused binary-format, parsing, escaping, and boundary tests. `zig build acceptance` runs the existing real-process HTTP journey and one browser journey against disposable SQLite/query fixtures. They cover native forms, SQL limits, structured mutations, Scratch recovery, late/lost acknowledgements, conflict choices, storage failure, and no-JavaScript use. `zig build browser-acceptance` runs just the browser journey. Set `CHROMIUM` if the browser is outside the usual system paths. The pinned browser driver is development-only; production has no Node dependency.
 
 ## Configuration
 
@@ -60,7 +61,7 @@ The Query page can keep ordinary `.sql` files beside the database-object navigat
 
 - Files are direct children of the configured query directory; no recursive file browser is exposed.
 - Scratch is one persistent draft per database, stored as the reserved `.dbui-scratch.sql` workspace file. It is created on the first save, hidden from the named-file list, saved after 500 ms without editor input, and flushed when the page is backgrounded or closed.
-- While a server save is pending, the browser keeps a per-database recovery copy in same-origin local storage. It is removed as soon as the server confirms the same editor generation; if both copies changed, dbui preserves both and requires an explicit choice.
+- While a server save is pending, the browser keeps a per-database recovery copy in same-origin local storage. It is removed only when the server confirms the same editor generation and the recovery record still belongs to that tab. A delayed response cannot clear a newer edit or another tab's newer recovery record. If both browser and server copies changed, dbui preserves both and requires an explicit choice. Browser storage may be disabled; in that case failed saves remain visible and the editor stays usable, but offline recovery is unavailable.
 - Opening Query selects the most recently written named file or Scratch. Explicit sidebar links always open the selected document.
 - A visible Save action and `Ctrl/Cmd+S` persist the current file.
 - The exact range that Run will execute is always highlighted: a browser selection wins, otherwise dbui asks SQLite to resolve the statement at the caret after a short debounce.
