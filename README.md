@@ -14,7 +14,7 @@ Every database request opens one SQLite connection, configures it, copies all re
 
 ## Prerequisites and pins
 
-- Zig `0.17.0-dev.1963+e00c6c439` (see `.zigversion` and `.zig-sha256`)
+- Zig `0.17.0-dev.2085+5e36170b5` (see `.zigversion` and `.zig-sha256`)
 - Compatible `web.zig` source frozen under `vendor/web` (revision and license in `vendor/web/PROVENANCE.md`); no sibling checkout required
 - A C compiler and libc, invoked by Zig
 - SQLite `3.53.4`, vendored under `vendor/sqlite`
