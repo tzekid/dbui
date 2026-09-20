@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { resolve, join } from 'node:path';
 import { spawn, execFileSync } from 'node:child_process';
 import { once } from 'node:events';
-import { createServer } from 'node:net';
+import { createServer, createConnection } from 'node:net';
 import { chromium } from 'playwright-core';
 
 const binary = resolve(process.argv[2] || 'zig-out/bin/dbui');
@@ -83,12 +83,20 @@ try {
     const { page, context } = await pageFor();
     const committed = deferred(), release = deferred();
     let count = 0;
+    let pendingRoutes = 0;
     await context.route(saveURL, async route => {
-      if (++count !== 1) return route.abort();
-      const response = await route.fetch();
-      committed.resolve();
-      await release.promise;
-      await route.fulfill({ response });
+      pendingRoutes += 1;
+      try {
+        // Keep the failed-save fixture explicit; the next group separately
+        // exercises a committed save whose network response is lost.
+        if (++count !== 1) return await route.fulfill({ status: 503, contentType: 'text/plain', body: 'unavailable' });
+        const response = await route.fetch();
+        committed.resolve();
+        await release.promise;
+        await route.fulfill({ response });
+      } finally {
+        pendingRoutes -= 1;
+      }
     });
     await editor(page).fill("SELECT 'acknowledged';");
     await until(() => committed.done, 'request committed before delayed acknowledgement');
@@ -102,6 +110,8 @@ try {
     await page.reload();
     assert.equal(await editor(page).inputValue(), "SELECT 'newer π';");
     await until(async () => await state(page).textContent() === 'Autosave failed', 'recovered draft still blocked by network fixture');
+    await until(() => pendingRoutes === 0, 'blocked autosave routes settled');
+    assert.equal(await readFile(scratch, 'utf8'), "SELECT 'acknowledged';");
     await context.unroute(saveURL);
     await page.locator('[data-save-button]').click();
     await saved(page);
@@ -295,6 +305,47 @@ try {
     await context.close();
   }
   console.log('browser: native SQL, CRLF saves, and read-only protection passed');
+
+  // Exercise the real single-worker application's partial-request boundary.
+  // More bytes must not extend the frozen App's 15-second request deadline.
+  const partialHead = 'POST /db/fixture/query HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: 100\r\n';
+  for (const kind of ['head', 'body', 'trickle']) {
+    const socket = createConnection({ host: '127.0.0.1', port });
+    socket.on('error', () => {}); // Closing incomplete input may reset the peer.
+    const closed = new Promise(done => socket.once('close', done));
+    let timeout, trickle;
+    try {
+      await once(socket, 'connect');
+      socket.write(kind === 'body' ? `${partialHead}\r\nsql=` : partialHead);
+      if (kind === 'trickle') {
+        socket.write('X-Progress: ');
+        trickle = setInterval(() => socket.write('x'), 200);
+      }
+      await Promise.race([closed, new Promise((_, reject) => {
+        timeout = setTimeout(() => reject(new Error(`${kind}: partial request exceeded its deadline`)), 18000);
+      })]);
+      const health = await fetch(`${origin}/healthz`, { signal: AbortSignal.timeout(2000) });
+      assert.equal(health.status, 200);
+      assert.equal(await health.text(), 'ok\n');
+    } finally {
+      clearTimeout(timeout);
+      clearInterval(trickle);
+      socket.destroy();
+    }
+  }
+  const stopped = once(server, 'exit');
+  let stopTimeout;
+  try {
+    server.kill('SIGTERM');
+    const [code, signal] = await Promise.race([stopped, new Promise((_, reject) => {
+      stopTimeout = setTimeout(() => reject(new Error('graceful shutdown exceeded the service window')), 12000);
+    })]);
+    assert.equal(code, 0);
+    assert.equal(signal, null);
+  } finally {
+    clearTimeout(stopTimeout);
+  }
+  console.log('http: partial heads/bodies and trickled input expire; health recovers; shutdown is clean');
 } catch (error) {
   console.error(serverLog);
   throw error;

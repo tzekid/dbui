@@ -106,8 +106,10 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, context: *Context) !void {
     try server.run(*Context, context, handle);
 }
 
-fn lifecycleError(err: anyerror, note: []const u8) void {
-    std.log.err("event=lifecycle_error error={s} note={s}", .{ @errorName(err), note });
+fn lifecycleError(err: anyerror, _: []const u8) void {
+    // SDK notes may contain a request target. Keep diagnostics independent of
+    // submitted paths, query strings and body-buffer contents.
+    std.log.err("event=lifecycle_error error={s}", .{@errorName(err)});
 }
 
 fn handle(context: *Context, request_context: *web_app.RequestContext) anyerror!void {

@@ -3,14 +3,105 @@
 //!
 //! This is the one copy of the skeleton that applications previously
 //! hand-rolled per repo. The accept task either queues a connection or
-//! answers 503 immediately — it never blocks and never drops silently. A
-//! stalled peer costs one worker for at most the idle timeout. Shutdown
+//! answers 503 immediately — it never blocks and never drops silently. An
+//! idle peer is bounded by the idle timeout; each started request also has
+//! one fixed network deadline, so partial input cannot hold a worker. Shutdown
 //! stops accepting, drains queued and in-flight connections up to a
 //! deadline, then force-closes stragglers and reports that it had to.
 
 const std = @import("std");
 const web_server = @import("web_server");
 const web_router = @import("web_router");
+
+// Each request gets one deadline across head/body reads and response writes.
+// Direct nonblocking Linux I/O keeps the App's existing no-libc boundary.
+const ConnectionIo = struct {
+    io: std.Io,
+    stream: std.Io.net.Stream,
+    deadline: ?std.Io.Clock.Timestamp = null,
+    timeout_ms: u64,
+    reader: std.Io.Reader,
+    writer: std.Io.Writer,
+
+    fn init(io: std.Io, stream: std.Io.net.Stream, timeout_ms: u64, read_buffer: []u8, write_buffer: []u8) ConnectionIo {
+        return .{
+            .io = io,
+            .stream = stream,
+            .timeout_ms = @min(timeout_ms, std.math.maxInt(i32) - 1),
+            .reader = .{ .vtable = &.{ .stream = read }, .buffer = read_buffer, .seek = 0, .end = 0 },
+            .writer = .{ .vtable = &.{ .drain = write }, .buffer = write_buffer },
+        };
+    }
+
+    fn beginRequest(self: *ConnectionIo) void {
+        self.deadline = if (self.timeout_ms == 0) null else .fromNow(self.io, .{
+            .raw = .fromMilliseconds(@intCast(self.timeout_ms)),
+            .clock = .awake,
+        });
+    }
+
+    fn wait(self: *ConnectionIo, events: i16) error{NetworkTimeout}!void {
+        var fds = [_]std.os.linux.pollfd{.{ .fd = self.stream.socket.handle, .events = events, .revents = 0 }};
+        while (true) {
+            const remaining: i32 = if (self.deadline) |deadline| wait_ms: {
+                const ms = deadline.durationFromNow(self.io).raw.toMilliseconds();
+                if (ms <= 0) return error.NetworkTimeout;
+                break :wait_ms @intCast(ms);
+            } else -1;
+            const rc = std.os.linux.poll(&fds, fds.len, remaining);
+            switch (std.os.linux.errno(rc)) {
+                .SUCCESS => if (rc > 0) return else return error.NetworkTimeout,
+                .INTR => continue,
+                else => return error.NetworkTimeout,
+            }
+        }
+    }
+
+    fn read(reader: *std.Io.Reader, writer: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+        const self: *ConnectionIo = @alignCast(@fieldParentPtr("reader", reader));
+        const data = limit.slice(try writer.writableSliceGreedy(1));
+        if (data.len == 0) return 0;
+        while (true) {
+            self.wait(std.posix.POLL.IN) catch return error.ReadFailed;
+            const rc = std.os.linux.recvfrom(self.stream.socket.handle, data.ptr, data.len, std.os.linux.MSG.DONTWAIT, null, null);
+            switch (std.os.linux.errno(rc)) {
+                .SUCCESS => {
+                    if (rc == 0) return error.EndOfStream;
+                    const n: usize = @intCast(rc);
+                    writer.advance(n);
+                    return n;
+                },
+                .INTR, .AGAIN => continue,
+                else => return error.ReadFailed,
+            }
+        }
+    }
+
+    fn write(writer: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        const self: *ConnectionIo = @alignCast(@fieldParentPtr("writer", writer));
+        const bytes = bytes: {
+            if (writer.end != 0) break :bytes writer.buffered();
+            for (data[0 .. data.len - @intFromBool(splat == 0)]) |part| {
+                if (part.len != 0) break :bytes part;
+            }
+            return 0;
+        };
+        while (true) {
+            self.wait(std.posix.POLL.OUT) catch return error.WriteFailed;
+            // Poll readiness alone cannot bound a blocking send. Keep the
+            // syscall nonblocking and recheck the same deadline on retry.
+            const rc = std.os.linux.sendto(self.stream.socket.handle, bytes.ptr, bytes.len, std.os.linux.MSG.DONTWAIT | std.os.linux.MSG.NOSIGNAL, null, 0);
+            switch (std.os.linux.errno(rc)) {
+                .SUCCESS => {
+                    if (rc == 0) return error.WriteFailed;
+                    return writer.consume(@intCast(rc));
+                },
+                .INTR, .AGAIN => continue,
+                else => return error.WriteFailed,
+            }
+        }
+    }
+};
 
 pub const Error = error{
     Unsupported,
@@ -65,6 +156,7 @@ pub const Options = struct {
     workers: ?usize = null,
     queue_depth: ?usize = null,
     connection: web_server.ConnectionOptions = .{},
+    /// Initial idle wait and each request's network deadline; zero disables both.
     idle_timeout_ms: u64 = 15_000,
     drain_timeout_ms: u64 = 10_000,
     healthz: bool = true,
@@ -474,25 +566,23 @@ pub const App = struct {
 
         var request_buffer: [16 * 1024]u8 = undefined;
         var response_buffer: [16 * 1024]u8 = undefined;
-        var connection_reader = stream.reader(app.io, &request_buffer);
-        var connection_writer = stream.writer(app.io, &response_buffer);
+        var connection_io = ConnectionIo.init(app.io, stream, app.options.idle_timeout_ms, &request_buffer, &response_buffer);
 
-        // The per-connection loop lives here (not in web_server) because the
-        // idle gate below must run before every blocking receive: socket
-        // timeouts (SO_RCVTIMEO) are not an option, the std Io treats EAGAIN
-        // from a blocking socket as a bug.
-        var server = std.http.Server.init(&connection_reader.interface, &connection_writer.interface);
+        // Wait for the first byte separately, then bound the complete request
+        // with one deadline that partial reads/writes cannot extend.
+        var server = std.http.Server.init(&connection_io.reader, &connection_io.writer);
         var handled: usize = 0;
         const maximum_requests = app.options.connection.maximum_requests;
         while (handled < maximum_requests) {
             app.active_in_handler[worker_index].store(false, .release);
-            if (connection_reader.interface.bufferedLen() == 0) {
+            if (connection_io.reader.bufferedLen() == 0) {
                 if (!app.waitReadable(stream)) return;
             }
+            connection_io.beginRequest();
             var request = server.receiveHead() catch |err| switch (err) {
                 error.HttpConnectionClosing => return,
                 error.HttpHeadersOversize => {
-                    web_server.writeHeaderTooLarge(&connection_writer.interface) catch {};
+                    web_server.writeHeaderTooLarge(&connection_io.writer) catch {};
                     return;
                 },
                 error.ReadFailed => return,

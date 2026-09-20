@@ -31,7 +31,7 @@ zig build acceptance
 zig build -Doptimize=ReleaseSafe
 ```
 
-`zig build test` contains a few focused binary-format, parsing, escaping, and boundary tests. `zig build acceptance` runs the existing real-process HTTP journey and one browser journey against disposable SQLite/query fixtures. They cover native forms, SQL limits, structured mutations, Scratch recovery, late/lost acknowledgements, conflict choices, storage failure, and no-JavaScript use. `zig build browser-acceptance` runs just the browser journey. Set `CHROMIUM` if the browser is outside the usual system paths. The pinned browser driver is development-only; production has no Node dependency.
+`zig build test` contains a few focused binary-format, parsing, escaping, and boundary tests. `zig build acceptance` runs the existing real-process HTTP journey and one browser journey against disposable SQLite/query fixtures. They cover native forms, SQL limits, structured mutations, Scratch recovery, late/lost acknowledgements, conflict choices, storage failure, and no-JavaScript use. The browser journey also checks recovery from partial and trickled HTTP requests and clean shutdown. `zig build browser-acceptance` runs that journey alone. Set `CHROMIUM` if the browser is outside the usual system paths. The pinned browser driver is development-only; production has no Node dependency.
 
 ## Configuration
 
@@ -102,9 +102,10 @@ The initial hard limits are:
 | Boundary | Limit |
 | --- | ---: |
 | Request target | 16 KiB |
+| Initial HTTP idle wait / request network deadline | 15 seconds each |
 | Ordinary POST body | 128 KiB |
-| Query/source POST body | 256 KiB encoded |
-| Decoded parameters | 64 parameters / 64 KiB ordinary, 80 KiB source forms |
+| Query/source POST body | 512 KiB encoded |
+| Decoded parameters | 64 parameters / 64 KiB ordinary, 144 KiB source forms |
 | SQL source | 64 KiB |
 | Query directory | 512 entries inspected / 128 SQL files |
 | Browse page | 25, 50, 100, or 250 rows |
