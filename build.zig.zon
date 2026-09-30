@@ -2,7 +2,7 @@
     .name = .dbui,
     .version = "0.1.0-dev",
     .fingerprint = 0xb875f449e0c985d9,
-    .minimum_zig_version = "0.17.0-dev.2307+392b17125",
+    .minimum_zig_version = "0.17.0-dev.2338+b46a7f3a2",
     .dependencies = .{
         // Compatible source snapshot; see vendor/web/PROVENANCE.md.
         .web = .{ .path = "vendor/web" },
