@@ -4,8 +4,9 @@ Source: https://github.com/tzekid/web.zig
 Revision: `4c53178bd6e7843eebe788163e5c4e8ec7d20710` (compatible ecosystem revision).
 License: MIT; see `LICENSE`.
 
-Captured tracked source with `git archive`; no Git metadata, caches, build outputs,
-or local planning files. Local changes relative to that revision:
+Captured with `git archive`, keeping only build inputs: `build.zig`,
+`build.zig.zon`, `src/`, the tests its build declares, and licenses. Local
+changes relative to that revision:
 
 - `build.zig.zon` includes the complete tests and external consumer in source
   exports with explicit source paths, excluding nested consumer build caches.
