@@ -1,5 +1,9 @@
 {
   "listen": "127.0.0.1:7432",
+  "auth": {
+    "origin": "https://dbui.plosca.ru",
+    "state_path": "/var/lib/dbui/auth.db"
+  },
   "databases": [
     {
       "id": "example",

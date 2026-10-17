@@ -13,6 +13,45 @@
 
   const staticSqlBlocks = document.querySelectorAll("code[data-sql-static]");
   const queryForm = document.querySelector("form[data-query-form]");
+  let sessionExpired = false;
+  function authenticationExpired(response) {
+    if (response.status !== 401) return false;
+    sessionExpired = true;
+    const region = document.querySelector('[data-query-response]') || document.querySelector('[data-query-result-region]') || queryForm;
+    let notice = document.querySelector('[data-session-expired]');
+    if (!notice) {
+      notice = document.createElement('p');
+      notice.className = 'notice notice--warning';
+      notice.dataset.sessionExpired = '';
+      notice.append('Your session expired. Your editor is kept here. ');
+      const link = document.createElement('a');
+      link.href = '/login?next=%2Fsecurity';
+      link.target = '_blank';
+      link.rel = 'noopener';
+      link.textContent = 'Sign in again in a new tab';
+      notice.append(link, ', then return to this tab to continue.');
+      (region || document.querySelector('main')).prepend(notice);
+    }
+    const state = document.querySelector('[data-save-state]');
+    if (state) state.textContent = 'Sign-in required';
+    return true;
+  }
+  async function refreshSession() {
+    if (!sessionExpired || document.hidden) return;
+    try {
+      const response = await fetch('/auth/session');
+      if (!response.ok) return;
+      const session = await response.json();
+      document.querySelectorAll('input[name="csrf_token"]').forEach(input => { input.value = session.csrf_token; });
+      sessionExpired = false;
+      document.querySelector('[data-session-expired]')?.remove();
+      const state = document.querySelector('[data-save-state]');
+      if (state) state.textContent = 'Signed in · save to continue';
+      editor.dispatchEvent(new Event('select'));
+    } catch (_) { /* Keep the editor and sign-in action available. */ }
+  }
+  window.addEventListener('focus', refreshSession);
+  document.addEventListener('visibilitychange', refreshSession);
   if (staticSqlBlocks.length === 0 && !queryForm) return;
 
   // This list comes from sqlite3_keyword_name() in the vendored SQLite 3.53.4
@@ -452,6 +491,7 @@
             cursor_byte: String(cursor),
           }),
         });
+        if (authenticationExpired(response)) return false;
         const source = (await response.text()).trim();
         if (key !== editorScopeKey() || editor.selectionStart !== editor.selectionEnd) return false;
         if (!response.ok) {
@@ -701,6 +741,7 @@
         method: "POST",
         body: encodedForm({ fragment: "save-state", confirm_write: null }),
       });
+      if (authenticationExpired(response)) return false;
       if (response.ok && response.headers.has("etag")) {
         acknowledgeSave(response, generation);
         return !dirty;
@@ -747,6 +788,7 @@
           body: encodedForm({ fragment: "save-state", confirm_write: null }),
           keepalive,
         });
+        if (authenticationExpired(response)) return false;
         if (response.ok && response.headers.has("etag")) {
           acknowledgeSave(response, generation);
           return true;
@@ -804,6 +846,7 @@
         method: "POST",
         body: encodedForm({ fragment: "query-result", confirm_write: confirmed || writeCheckbox?.checked ? "1" : null }),
       });
+      if (authenticationExpired(response)) return;
       const source = await response.text();
       if (/^\s*<!doctype html>/i.test(source)) {
         replaceFullPage(source, generation);

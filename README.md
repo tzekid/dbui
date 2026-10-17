@@ -1,16 +1,16 @@
 # dbui
 
-`dbui` is a compact, self-hosted SQLite workbench for one trusted administrator. It exposes only explicitly configured local SQLite files through server-rendered HTML and ordinary links and forms. JavaScript is a small optional enhancement, not an application runtime.
+`dbui` is a compact, self-hosted SQLite workbench for one trusted administrator. It exposes only explicitly configured local SQLite files through server-rendered HTML and ordinary links and forms. Sign-in uses passkeys, including Apple Passwords with Face ID or Touch ID. JavaScript is required for the browser's passkey API; database pages and native forms work without it after sign-in.
 
 ## Architecture
 
 The runtime is one Zig process behind Caddy:
 
 ```text
-browser -> Caddy TLS + authentication -> 127.0.0.1:7432 -> dbui -> configured SQLite files
+browser -> Caddy TLS -> 127.0.0.1:7432 -> dbui passkey/session gate -> configured SQLite files
 ```
 
-Every database request opens one SQLite connection, configures it, copies all result data into request-owned memory, finalizes statements, closes the connection, and only then renders the typed view model. Connections and SQLite-owned text/BLOB pointers never cross a request boundary. There is no pool, cache, ORM, control database, background worker, frontend framework, or JSON CRUD API.
+Every database request opens one SQLite connection, configures it, copies all result data into request-owned memory, finalizes statements, closes the connection, and only then renders the typed view model. Connections and SQLite-owned text/BLOB pointers never cross a request boundary. A separate private SQLite database stores passkey public keys, hashed session/setup tokens, and expiring challenges. It is never part of the browsable database registry. There is no pool, cache, ORM, background worker, frontend framework, or JSON CRUD API.
 
 ## Prerequisites and pins
 
@@ -18,6 +18,7 @@ Every database request opens one SQLite connection, configures it, copies all re
 - Compatible `web.zig` source frozen under `vendor/web` (revision and license in `vendor/web/PROVENANCE.md`); no sibling checkout required
 - A C compiler and libc, invoked by Zig
 - SQLite `3.53.4`, vendored under `vendor/sqlite`
+- Passcay and zbor, vendored from the qualified Analytico implementation; provenance and licenses under `vendor/passcay` and `vendor/zbor`
 - `sqlite3`, `curl`, Node.js, and system Chromium only for acceptance journeys
 
 The SQLite amalgamation archive is pinned in `vendor/sqlite/SHA3SUM`. SQLite is compiled directly by `build.zig` with `SQLITE_OMIT_LOAD_EXTENSION`; no Make, CMake, Node, Python, or frontend build is involved.
@@ -31,7 +32,7 @@ zig build acceptance
 zig build -Doptimize=ReleaseSafe
 ```
 
-`zig build test` contains a few focused binary-format, parsing, escaping, and boundary tests. `zig build acceptance` runs the existing real-process HTTP journey and one browser journey against disposable SQLite/query fixtures. They cover native forms, SQL limits, structured mutations, Scratch recovery, late/lost acknowledgements, conflict choices, storage failure, and no-JavaScript use. The browser journey also checks recovery from partial and trickled HTTP requests and clean shutdown. `zig build browser-acceptance` runs that journey alone. Set `CHROMIUM` if the browser is outside the usual system paths. The pinned browser driver is development-only; production has no Node dependency.
+`zig build test` contains focused binary-format, parsing, escaping, and boundary tests. `zig build acceptance` runs real-process HTTP, browser editor, and passkey journeys against disposable fixtures. They cover native forms, SQL limits, structured mutations, Scratch recovery, late/lost acknowledgements, conflicts, storage failure, and no-JavaScript database use after sign-in. The browser journey also checks partial and trickled HTTP requests and clean shutdown. The authentication journey uses Chromium's virtual authenticator with the real WebAuthn API: enrollment, login, replay rejection, restart persistence, CSRF, key management, revocation, session-expiry editor recovery, and backed-up operator recovery. `zig build browser-acceptance` and `zig build auth-acceptance` run those journeys separately. Set `CHROMIUM` if the browser is outside the usual system paths. The pinned browser driver is development-only; production has no Node dependency.
 
 ## Configuration
 
@@ -46,12 +47,13 @@ dbui --version
 
 See [`examples/config.json`](examples/config.json). Only these fields are accepted:
 
-- Top level: `listen`, `databases`
+- Top level: `listen`, `databases`, `auth`
+- Auth: `origin` (exact public HTTPS origin, without a trailing slash), `state_path` (absolute private `.db` path)
 - Database: `id`, `label`, `path`, `mode`, optional `queries_path`
 
 Database IDs match `[a-z0-9][a-z0-9_-]{0,63}`. Paths must be absolute, existing regular files. They are canonicalized at startup; duplicate IDs and canonical paths are rejected. Every mode is explicit: `read-only` or `read-write`. Missing files are never created, and any invalid database prevents the server from starting.
 
-The listener is restricted to `127.0.0.1` or `::1`. Keep it behind an authenticated reverse proxy.
+The listener is restricted to `127.0.0.1` or `::1`. Keep it behind an HTTPS reverse proxy. Authentication runs inside dbui; remove proxy Basic Auth when migrating. Only `localhost` may use HTTP for local development; WebAuthn requires a domain rather than an IP address. Passkeys are bound to the configured hostname and exact origin; changing the origin after enrollment is refused at startup. The parent directory of `auth.state_path` must already exist with mode `0700`; dbui creates its database with mode `0600`. See [passkey setup, sessions, and recovery](docs/authentication.md).
 
 `queries_path` enables the file-backed Query workspace for that database. It must be an absolute, existing, dedicated directory that the service can read and write. dbui canonicalizes it, rejects duplicate query directories, and performs an exclusive create/delete probe during `--check`; it never creates a missing query directory. Without `queries_path`, Query remains a disposable Scratch console.
 
@@ -74,7 +76,7 @@ The Query page can keep ordinary `.sql` files beside the database-object navigat
 
 Files are limited to 64 KiB and valid UTF-8. Browser-submitted CRLF transport is canonicalized back to the editor's LF representation. Existing files preserve consistent LF or CRLF on save. Mixed or bare-CR files, NUL-containing files, invalid UTF-8, oversized files, symlinks, and non-regular files are never silently normalized or followed.
 
-Every file page carries a SHA-256 revision. Scratch autosave and named-file Save, Run, Rename, and Delete reject stale revisions; a conflict preserves the submitted browser buffer and never silently overwrites the disk file. Saves use same-directory atomic replacement and preserve the existing file permissions. Query files may remain editable even when the database itself is configured read-only; saving SQL never grants permission to execute a database write.
+Every file page carries a SHA-256 revision. Scratch autosave and named-file Save, Run, Rename, and Delete reject stale revisions; a conflict preserves the submitted browser buffer and never silently overwrites the disk file. Retrying a save whose exact bytes are already on disk acknowledges the current revision without rewriting the file. Saves use same-directory atomic replacement and preserve the existing file permissions. Query files may remain editable even when the database itself is configured read-only; saving SQL never grants permission to execute a database write.
 
 ## Read-only and read/write behavior
 
@@ -121,9 +123,11 @@ Ordinary browsing fetches one extra row to determine whether `Next` exists and n
 
 ## Security model
 
-- One trusted administrator; authentication and public TLS belong to Caddy.
-- One random 256-bit CSRF token is generated at process startup and constant-time checked on every POST.
-- When present, `Origin` must match `Host`.
+- One trusted administrator; dbui verifies passkeys and Caddy terminates public TLS.
+- Discoverable WebAuthn credentials require user presence and device verification. ES256 and RS256 are supported; no identifying attestation is requested. Verification is shared with Analytico/Cloudio, with bounded CBOR parsing before the vendored parser.
+- Expiring, single-use challenges are bound to the browser, ceremony, exact origin, RP ID, and setup authorization or current session. Synced-passkey counters are recorded without rejecting legitimate synchronization.
+- Each session has a random CSRF token, constant-time checked on unsafe requests. Every POST requires the exact configured `Origin`; `Host` must match the configured public authority.
+- Production sessions use host-only `__Host-dbui_session` cookies with `Secure`, `HttpOnly`, `SameSite=Strict`, and `Path=/`. Session/setup secrets are stored only as hashes. Setup and login routes have per-client and global rate limits.
 - HTML is server-rendered with context-specific escaping.
 - Values are always bound. Generated identifiers must first match current introspection and pass the one central double-quote function.
 - Extension loading is omitted at compile time and disabled on connections.
@@ -143,7 +147,7 @@ systemctl --user enable --now dbui.service
 systemctl --user status dbui.service
 ```
 
-[`deploy/Caddyfile.example`](deploy/Caddyfile.example) uses `dbui.plosca.ru`, Caddy `basic_auth`, and the loopback upstream. Generate a supported password hash with `caddy hash-password`; never put plaintext in the Caddyfile.
+[`deploy/Caddyfile.example`](deploy/Caddyfile.example) uses `dbui.plosca.ru`, public TLS, and the loopback upstream. Preserve the public Host and overwrite untrusted forwarded-client headers. Remove `basic_auth`, or iOS will continue to show its password dialog before the passkey page.
 
 Read-only database files should also be read-only at the OS boundary. Read/write entries need write/search permission on their parent directories and access to `-wal` and `-shm` sidecars. Do not grant broad project or `/srv` write access.
 
@@ -154,7 +158,7 @@ Do not naively copy an active database as a backup without accounting for its ro
 ## Known limitations and deliberately deferred work
 
 - SQLite only
-- One trusted administrator with external authentication
+- One trusted administrator with passkeys; no multi-user accounts or RBAC
 - One SQL statement per Run; no Run All or multiple result tabs
 - File-backed saved SQL is optional; there is no automatic query history, folder tree, or autocomplete
 - External SQL-file edits are detected on the next action or reload, not pushed live
@@ -165,4 +169,4 @@ Do not naively copy an active database as a backup without accounting for its ro
 - No import/export
 - No schema mutation UI or designer
 - No backup/restore interface
-- No user accounts, sessions, RBAC, plugins, AI, MCP, WebSockets, SSE, or public JSON CRUD API
+- No plugins, AI, MCP, WebSockets, SSE, or public JSON CRUD API

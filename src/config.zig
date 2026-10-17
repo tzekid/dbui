@@ -19,9 +19,28 @@ pub const Listen = struct {
     port: u16,
 };
 
+pub const Auth = struct {
+    origin: []const u8,
+    state_path: []const u8,
+
+    pub fn secure(self: Auth) bool {
+        return std.mem.startsWith(u8, self.origin, "https://");
+    }
+
+    pub fn host(self: Auth) []const u8 {
+        return self.origin[if (self.secure()) @as(usize, 8) else 7..];
+    }
+
+    pub fn rpId(self: Auth) []const u8 {
+        const value = self.host();
+        return value[0 .. std.mem.indexOfScalar(u8, value, ':') orelse value.len];
+    }
+};
+
 pub const Registry = struct {
     listen: Listen,
     databases: []const DatabaseConfig,
+    auth: Auth,
 
     pub fn find(self: *const Registry, id: []const u8) ?*const DatabaseConfig {
         for (self.databases) |*database| {
@@ -66,14 +85,50 @@ pub const Registry = struct {
                 return error.InvalidConfiguration;
             };
         }
-        return .{ .listen = listen, .databases = databases };
+        const auth = raw.auth;
+        try validateAuth(allocator, io, auth, databases);
+        return .{ .listen = listen, .databases = databases, .auth = auth };
     }
 };
 
 const RawConfig = struct {
     listen: []const u8,
     databases: []const RawDatabase,
+    auth: Auth,
 };
+
+fn validateAuth(allocator: std.mem.Allocator, io: std.Io, auth: Auth, databases: []const DatabaseConfig) !void {
+    if (!(auth.secure() or std.mem.startsWith(u8, auth.origin, "http://"))) return error.InvalidAuthOrigin;
+    const host = auth.host();
+    if (host.len == 0 or host.len > 253 or std.mem.indexOfAny(u8, host, "/?#@\\ \t\r\n") != null) return error.InvalidAuthOrigin;
+    const rp_id = auth.rpId();
+    if (rp_id.len == 0) return error.InvalidAuthOrigin;
+    for (rp_id) |byte| if (!(std.ascii.isLower(byte) or std.ascii.isDigit(byte) or byte == '.' or byte == '-')) return error.InvalidAuthOrigin;
+    var labels = std.mem.splitScalar(u8, rp_id, '.');
+    var numeric = true;
+    while (labels.next()) |label| {
+        if (label.len == 0 or label.len > 63 or label[0] == '-' or label[label.len - 1] == '-') return error.InvalidAuthOrigin;
+        for (label) |byte| if (!std.ascii.isDigit(byte)) {
+            numeric = false;
+        };
+    }
+    if (numeric) return error.AuthOriginMustBeDomain;
+    if (!auth.secure() and !std.mem.eql(u8, rp_id, "localhost")) return error.AuthRequiresHttps;
+    if (std.mem.indexOfScalar(u8, host, ':')) |separator| {
+        const port = std.fmt.parseInt(u16, host[separator + 1 ..], 10) catch return error.InvalidAuthOrigin;
+        if (port == 0) return error.InvalidAuthOrigin;
+    }
+    if (!std.fs.path.isAbsolute(auth.state_path) or !std.mem.endsWith(u8, auth.state_path, ".db")) return error.InvalidAuthStatePath;
+    const parent = std.fs.path.dirname(auth.state_path) orelse return error.InvalidAuthStatePath;
+    const canonical = try std.Io.Dir.realPathFileAbsoluteAlloc(io, parent, allocator);
+    if (!std.mem.eql(u8, canonical, parent)) return error.AuthPathMustBeCanonical;
+    const stat = try std.Io.Dir.cwd().statFile(io, parent, .{ .follow_symlinks = false });
+    if (stat.kind != .directory or stat.permissions.toMode() & 0o077 != 0) return error.AuthDirectoryMustBePrivate;
+    for (databases) |database| {
+        if (std.mem.eql(u8, database.path, auth.state_path)) return error.AuthDatabaseMustBePrivate;
+        if (database.queries_path) |path| if (std.mem.eql(u8, path, parent)) return error.AuthDatabaseMustBePrivate;
+    }
+}
 
 const RawDatabase = struct {
     id: []const u8,

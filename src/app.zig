@@ -12,6 +12,7 @@ const query_mod = @import("query.zig");
 const query_files = @import("query_files.zig");
 const mutate = @import("mutate.zig");
 const views = @import("views.zig");
+const auth = @import("auth.zig");
 
 const app_css = @embedFile("app_css");
 const app_js = @embedFile("app_js");
@@ -115,7 +116,9 @@ fn lifecycleError(err: anyerror, _: []const u8) void {
 fn handle(context: *Context, request_context: *web_app.RequestContext) anyerror!void {
     const id = context.next_request_id.fetchAdd(1, .monotonic) + 1;
     const started = std.Io.Timestamp.now(request_context.io, .awake);
-    const outcome = dispatch(context, request_context, id) catch |err| blk: {
+    // Session CSRF belongs to this request, never shared across sessions.
+    var scoped: Context = .{ .registry = context.registry, .csrf_token = undefined };
+    const outcome = dispatch(&scoped, request_context, id) catch |err| blk: {
         std.log.err("event=request_error request_id={d} error={s}", .{ id, @errorName(err) });
         const body = views.errorPage(
             request_context.arena,
@@ -148,6 +151,12 @@ fn handle(context: *Context, request_context: *web_app.RequestContext) anyerror!
 }
 
 fn dispatch(context: *Context, request_context: *web_app.RequestContext, request_id: u64) !Outcome {
+    switch (try auth.dispatch(context.registry, request_context)) {
+        .responded => |status| return .{ .status = status, .route_name = "authentication" },
+        .allowed => |session| if (session) |current| {
+            context.csrf_token = current.csrf;
+        },
+    }
     const target = request.Target.parse(request_context.request.head.target, 16 * 1024) catch {
         try problem(context, request_context, null, .bad_request, "Invalid request", "The request target is invalid.", request_id);
         return .{ .status = .bad_request, .route_name = "invalid" };

@@ -1,7 +1,4 @@
 dbui.plosca.ru {
-    basic_auth {
-        admin <caddy-supported-password-hash>
-    }
-
-    reverse_proxy 127.0.0.1:7432
+	header Strict-Transport-Security "max-age=31536000"
+	reverse_proxy 127.0.0.1:7432
 }

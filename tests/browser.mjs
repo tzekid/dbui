@@ -7,6 +7,7 @@ import { spawn, execFileSync } from 'node:child_process';
 import { once } from 'node:events';
 import { createServer, createConnection } from 'node:net';
 import { chromium } from 'playwright-core';
+import { enroll } from './passkey-helper.mjs';
 
 const binary = resolve(process.argv[2] || 'zig-out/bin/dbui');
 const scratchKey = 'dbui:scratch:fixture';
@@ -35,7 +36,7 @@ try {
   await once(reservation, 'listening');
   const port = reservation.address().port;
   await new Promise(done => reservation.close(done));
-  const origin = `http://127.0.0.1:${port}`;
+  const origin = `http://localhost:${port}`;
   const queries = join(temp, 'queries');
   const database = join(temp, 'fixture.db');
   await mkdir(queries);
@@ -47,7 +48,7 @@ try {
   const roDatabase = join(temp, 'readonly.db');
   await writeFile(roDatabase, await readFile(database));
   const config = join(temp, 'config.json');
-  await writeFile(config, JSON.stringify({ listen: `127.0.0.1:${port}`, databases: [
+  await writeFile(config, JSON.stringify({ listen: `127.0.0.1:${port}`, auth: { origin, state_path: join(temp, 'auth.db') }, databases: [
     { id: 'fixture', label: 'Fixture', path: database, mode: 'read-write', queries_path: queries },
     { id: 'readonly', label: 'Read only', path: roDatabase, mode: 'read-only' },
   ] }));
@@ -62,10 +63,14 @@ try {
   const executablePath = process.env.CHROMIUM || ['/usr/bin/chromium', '/usr/bin/chromium-browser', '/usr/bin/google-chrome'].find(existsSync);
   assert.ok(executablePath, 'Set CHROMIUM to a system Chromium executable');
   browser = await chromium.launch({ executablePath, headless: true, args: ['--no-sandbox'] });
+  const enrolled = await enroll(binary, config, origin, browser);
+  const sessionCookies = enrolled.cookies;
+  await enrolled.context.close();
   const saveURL = `${origin}/db/fixture/query/scratch/save`;
   const scratchURL = `${origin}/db/fixture/query?scratch=1`;
   async function pageFor(options = {}, init) {
     const context = await browser.newContext(options);
+    await context.addCookies(sessionCookies);
     if (init) await context.addInitScript(init);
     const page = await context.newPage();
     page.setDefaultTimeout(10000);
@@ -117,6 +122,7 @@ try {
     await saved(page);
     assert.equal(await recovery(page), null);
     assert.equal(await readFile(scratch, 'utf8'), "SELECT 'newer π';");
+    await context.unrouteAll({ behavior: 'wait' });
     await context.close();
   }
   console.log('browser: late save acknowledgement and failed-save reload passed');
@@ -129,9 +135,13 @@ try {
     await until(async () => await state(page).textContent() === 'Autosave failed', 'lost response');
     assert.equal(await readFile(scratch, 'utf8'), "SELECT 'response lost';");
     assert.equal((await recovery(page)).source, "SELECT 'response lost';");
+    // The committed/lost response has been observed. Finish its interceptor
+    // before navigation can cancel a later keepalive request from this page.
+    await context.unrouteAll({ behavior: 'wait' });
     await page.reload();
     assert.equal(await editor(page).inputValue(), "SELECT 'response lost';");
     assert.equal(await recovery(page), null);
+    await context.unrouteAll({ behavior: 'wait' });
     await context.close();
   }
   console.log('browser: lost response reconciliation passed');
@@ -159,6 +169,7 @@ try {
     await other.reload();
     assert.equal(await editor(other).inputValue(), "SELECT 'second tab draft';");
     assert.equal(await other.locator('[data-run-button]').isDisabled(), true);
+    await context.unrouteAll({ behavior: 'wait' });
     await context.close();
   }
   console.log('browser: recovery ownership across tabs passed');
@@ -176,6 +187,7 @@ try {
     await page.getByRole('link', { name: 'Use server Scratch' }).click();
     assert.equal(await editor(page).inputValue(), "SELECT 'external edit';");
     assert.equal(await recovery(page), null);
+    await context.unrouteAll({ behavior: 'wait' });
     await context.close();
   }
   console.log('browser: explicit recovery conflict choice passed');
@@ -195,6 +207,7 @@ try {
     await page.locator('[data-save-button]').click();
     await saved(page);
     assert.equal(await readFile(scratch, 'utf8'), "SELECT 'storage unavailable';");
+    await context.unrouteAll({ behavior: 'wait' });
     await context.close();
   }
   console.log('browser: disabled storage and explicit save passed');
@@ -228,6 +241,7 @@ try {
     assert.equal(queryRequests, 1, 'rapid submissions must produce one in-flight query');
     await page.reload();
     assert.equal(await editor(page).inputValue(), "SELECT 'edited during query';");
+    await context.unrouteAll({ behavior: 'wait' });
     await context.close();
   }
   console.log('browser: editing while a query is in flight passed');
@@ -281,6 +295,7 @@ try {
     await page.locator('[data-save-button]').click();
     await until(async () => await state(page).textContent() === 'Saved', 'explicitly reapplied conflict buffer');
     assert.equal(await readFile(join(queries, 'named.sql'), 'utf8'), "SELECT 'typed during conflict';\r\n");
+    await context.unrouteAll({ behavior: 'wait' });
     await context.close();
   }
   console.log('browser: named-file late acknowledgements and conflict buffers passed');
@@ -302,13 +317,15 @@ try {
     await page.locator('[data-run-button]').click();
     assert.equal(execFileSync('sqlite3', [roDatabase, 'SELECT count(*) FROM items;'], { encoding: 'utf8' }).trim(), '1');
     assert.match(await page.getByRole('alert').textContent(), /read.only|not authorized/i);
+    await context.unrouteAll({ behavior: 'wait' });
     await context.close();
   }
   console.log('browser: native SQL, CRLF saves, and read-only protection passed');
 
   // Exercise the real single-worker application's partial-request boundary.
   // More bytes must not extend the frozen App's 15-second request deadline.
-  const partialHead = 'POST /db/fixture/query HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: 100\r\n';
+  const sessionCookie = sessionCookies.find(item => item.name === 'dbui_session');
+  const partialHead = `POST /db/fixture/query HTTP/1.1\r\nHost: localhost:${port}\r\nOrigin: ${origin}\r\nCookie: ${sessionCookie.name}=${sessionCookie.value}\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: 100\r\n`;
   for (const kind of ['head', 'body', 'trickle']) {
     const socket = createConnection({ host: '127.0.0.1', port });
     socket.on('error', () => {}); // Closing incomplete input may reset the peer.

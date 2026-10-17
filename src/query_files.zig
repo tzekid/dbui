@@ -313,13 +313,16 @@ fn saveLeaf(
     defer directory.close(io);
 
     const original = try readRaw(allocator, io, directory, name);
-    if (!std.mem.eql(u8, &original.revision, base_revision)) return error.FileConflict;
     const normalized = normalize(allocator, original.bytes) catch return error.FileNotEditable;
     const encoded = try encode(allocator, canonical_source, normalized.style);
     const next_revision = hash(encoded);
     if (std.mem.eql(u8, &original.revision, &next_revision)) {
         return .{ .revision = next_revision, .changed = false };
     }
+    // A lost acknowledgement or overlapping pagehide save may leave an older
+    // base revision for bytes that are already present. Acknowledge that exact
+    // state without writing; different bytes still require a matching base.
+    if (!std.mem.eql(u8, &original.revision, base_revision)) return error.FileConflict;
 
     var atomic = try directory.createFileAtomic(io, name, .{
         .permissions = ordinaryPermissions(original.permissions),

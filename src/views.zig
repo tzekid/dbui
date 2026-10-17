@@ -1062,7 +1062,7 @@ fn shellStart(
     // Versioned URLs bypass browsers that cached older embedded assets.
     try html.documentStart(writer, .{
         .title = title,
-        .head = .audited("<link rel=\"icon\" href=\"data:,\"><link rel=\"stylesheet\" href=\"/assets/app.css?v=5\"><script src=\"/assets/app.js?v=5\" defer></script>"),
+        .head = .audited("<link rel=\"icon\" href=\"data:,\"><link rel=\"stylesheet\" href=\"/assets/app.css?v=6\"><script src=\"/assets/app.js?v=6\" defer></script>"),
     });
     try writer.writeAll("<header class=\"topbar\"><a class=\"brand\" href=\"/\">dbui</a>");
     if (current) |database| {
@@ -1087,7 +1087,7 @@ fn shellStart(
         try sectionLink(writer, database.id, "/query", "Query", active == .query, null, preserve_internal);
         try writer.writeAll("</nav>");
     }
-    try writer.writeAll("</header><div class=\"app-shell\">");
+    try writer.writeAll("<a class=\"security-link\" href=\"/security\">Security</a></header><div class=\"app-shell\">");
     if (sidebar_view) |value| try renderSidebar(writer, value, active);
 }
 

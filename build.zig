@@ -30,10 +30,14 @@ pub fn build(b: *std.Build) void {
     acceptance.addArtifactArg(executable);
     const browser = b.addSystemCommand(&.{ "node", "tests/browser.mjs" });
     browser.addArtifactArg(executable);
+    const auth_journey = b.addSystemCommand(&.{ "node", "tests/auth.mjs" });
+    auth_journey.addArtifactArg(executable);
+    b.step("auth-acceptance", "Run real-browser passkey, session and recovery journeys").dependOn(&auth_journey.step);
     b.step("browser-acceptance", "Run real-browser editor recovery and native forms").dependOn(&browser.step);
     const product = b.step("acceptance", "Run disposable HTTP and browser product journeys");
     product.dependOn(&acceptance.step);
     product.dependOn(&browser.step);
+    product.dependOn(&auth_journey.step);
 }
 
 fn applicationModule(
@@ -57,6 +61,11 @@ fn applicationModule(
             .{ .name = "web_router", .module = web.module("web_router") },
         },
     });
+    const zbor = b.createModule(.{ .root_source_file = b.path("vendor/zbor/src/main.zig"), .target = target, .optimize = optimize });
+    const passcay = b.createModule(.{ .root_source_file = b.path("vendor/passcay/src/public.zig"), .target = target, .optimize = optimize });
+    passcay.addImport("zbor", zbor);
+    module.addImport("passcay", passcay);
+    module.addImport("zbor", zbor);
     module.addIncludePath(b.path("vendor/sqlite"));
     module.addCSourceFile(.{
         .file = b.path("vendor/sqlite/sqlite3.c"),
@@ -69,5 +78,6 @@ fn applicationModule(
     });
     module.addAnonymousImport("app_css", .{ .root_source_file = b.path("assets/app.css") });
     module.addAnonymousImport("app_js", .{ .root_source_file = b.path("assets/app.js") });
+    module.addAnonymousImport("auth_js", .{ .root_source_file = b.path("assets/auth.js") });
     return module;
 }
