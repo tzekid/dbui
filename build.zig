@@ -2,7 +2,7 @@ const std = @import("std");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
-    const optimize = b.standardOptimizeOption(.{});
+    const optimize = b.standardOptimizeOption(.{}) orelse .debug;
     const web = b.dependency("web", .{ .target = target, .optimize = optimize });
 
     const sqlite_translate = b.addTranslateC(.{
